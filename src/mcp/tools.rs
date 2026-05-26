@@ -41,9 +41,7 @@ impl M0SmokeServer {
 
         context
             .peer
-            .notify_resource_updated(ResourceUpdatedNotificationParam::new(
-                "port-mcp://m0/smoke",
-            ))
+            .notify_resource_updated(ResourceUpdatedNotificationParam::new("port-mcp://m0/smoke"))
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
 
@@ -58,7 +56,9 @@ impl M0SmokeServer {
             "resource_notification": "sent"
         });
 
-        Ok(CallToolResult::success(vec![Content::text(payload.to_string())]))
+        Ok(CallToolResult::success(vec![Content::text(
+            payload.to_string(),
+        )]))
     }
 }
 
@@ -97,8 +97,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m0_smoke_tool_observes_context_and_sends_resource_notification(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn m0_smoke_tool_observes_context_and_sends_resource_notification()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (server_transport, client_transport) = tokio::io::duplex(4096);
 
         let server_handle = tokio::spawn(async move {
@@ -135,8 +135,11 @@ mod tests {
         assert!(text.contains("\"resource_notification\":\"sent\""));
         assert!(text.contains("\"session_mode\":\"unverified_m0_spike\""));
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), resource_updated.notified())
-            .await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            resource_updated.notified(),
+        )
+        .await?;
 
         client.cancel().await?;
         server_handle.await??;
