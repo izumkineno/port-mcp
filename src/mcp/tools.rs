@@ -4,23 +4,20 @@ use std::{
 };
 
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler,
-    handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content},
-    schemars,
-    service::RequestContext,
-    tool, tool_handler, tool_router,
+    ErrorData as McpError, RoleServer, ServerHandler, handler::server::wrapper::Parameters,
+    model::CallToolResult, schemars, service::RequestContext, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     app::{InstanceService, PortService},
+    mcp::response,
     mcp::session::SessionMode,
     model::{
         DataBits, DomainError, ErrorCode, FlowControl, HandleId, IdGenerator, InstanceState,
-        InstanceSummary, InstanceType, Parity, Payload, PayloadEncoding, SerialConfig, StopBits,
-        TcpConfig, TcpMode, Timestamp, ToolResponse, UdpConfig,
+        InstanceSummary, InstanceType, Parity, Payload, PayloadEncoding, RuntimeLimits,
+        SerialConfig, StopBits, TcpConfig, TcpMode, Timestamp, ToolResponse, UdpConfig,
     },
     runtime::ClearTarget,
 };
@@ -58,12 +55,13 @@ impl PortMcpServer {
         ToolResponse::failure(tool, self.next_request_id(), Timestamp::now_utc(), error)
     }
 
-    fn result(&self, response: ToolResponse) -> Result<CallToolResult, McpError> {
-        let started_at = Instant::now();
-        log_tool_response(&response, started_at.elapsed().as_millis() as u64);
-        let text = serde_json::to_string(&response)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+    fn result(
+        &self,
+        started_at: Instant,
+        response: ToolResponse,
+    ) -> Result<CallToolResult, McpError> {
+        let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        response::call_tool_result_with_duration(response, duration_ms)
     }
 
     fn with_app<T>(&self, operation: impl FnOnce(&mut InstanceService) -> T) -> T {
@@ -294,14 +292,19 @@ impl PortMcpServer {
         &self,
         Parameters(params): Parameters<InstanceCreateParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let summary = self.with_app(|app| app.create(params.instance_type.into()));
-        self.summary_response("instance_create", summary)
+        self.summary_response(started_at, "instance_create", summary)
     }
 
     #[tool(description = "List active port instances")]
     pub async fn instance_list(&self) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let instances = self.with_app(|app| app.list());
-        self.result(self.ok("instance_list", json!({ "instances": instances })))
+        self.result(
+            started_at,
+            self.ok("instance_list", json!({ "instances": instances })),
+        )
     }
 
     #[tool(description = "Query an instance by handle id or current session default")]
@@ -310,10 +313,11 @@ impl PortMcpServer {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<InstanceQueryParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let handle = params.handle_id.as_deref().map(HandleId::from);
         let session_id = self.session_id(&context);
         let summary = self.with_app(|app| app.query(handle.as_ref(), Some(&session_id)));
-        self.summary_response("instance_query", summary)
+        self.summary_response(started_at, "instance_query", summary)
     }
 
     #[tool(description = "Bind an instance as the current session default")]
@@ -322,6 +326,7 @@ impl PortMcpServer {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<HandleParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let session_id = self.session_id(&context);
         let previous = self.with_app(|app| app.use_instance(Some(&session_id), &handle));
@@ -334,7 +339,7 @@ impl PortMcpServer {
                 .with_handle(handle),
             Err(error) => self.err("instance_use", error).with_handle(handle),
         };
-        self.result(response)
+        self.result(started_at, response)
     }
 
     #[tool(description = "Release an instance")]
@@ -342,9 +347,10 @@ impl PortMcpServer {
         &self,
         Parameters(params): Parameters<InstanceReleaseParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let summary = self.with_app(|app| app.release(&handle, params.force));
-        self.summary_response("instance_release", summary)
+        self.summary_response(started_at, "instance_release", summary)
     }
 
     #[tool(description = "Configure a Serial instance")]
@@ -352,6 +358,7 @@ impl PortMcpServer {
         &self,
         Parameters(params): Parameters<SerialConfigParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let config = SerialConfig {
             port: params.port,
@@ -364,7 +371,7 @@ impl PortMcpServer {
             encoding: map_encoding(params.encoding),
         };
         let summary = self.with_app(|app| app.configure_serial(&handle, config));
-        self.summary_response("serial_config", summary)
+        self.summary_response(started_at, "serial_config", summary)
     }
 
     #[tool(description = "Configure a TCP or UDP instance")]
@@ -372,6 +379,7 @@ impl PortMcpServer {
         &self,
         Parameters(params): Parameters<TcpUdpConfigParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let summary = self.with_app(|app| {
             match app
@@ -417,7 +425,7 @@ impl PortMcpServer {
                 Err(error) => Err(error),
             }
         });
-        self.summary_response("tcp_udp_config", summary)
+        self.summary_response(started_at, "tcp_udp_config", summary)
     }
 
     #[tool(description = "Scan allowed loopback TCP ports")]
@@ -425,6 +433,25 @@ impl PortMcpServer {
         &self,
         Parameters(params): Parameters<PortScanParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let limits = RuntimeLimits::default();
+        if params.timeout_ms == 0 || params.timeout_ms > limits.scan_total_timeout_ms {
+            return self.result(
+                started_at,
+                self.err(
+                    "port_scan",
+                    DomainError::invalid_argument(
+                        ErrorCode::InvalidRange,
+                        "port_scan timeout_ms is outside the allowed range.",
+                        "Use a timeout between 1 and the configured scan_total_timeout_ms.",
+                    )
+                    .with_detail("field", json!("timeout_ms"))
+                    .with_detail("min", json!(1))
+                    .with_detail("max", json!(limits.scan_total_timeout_ms))
+                    .with_detail("actual", json!(params.timeout_ms)),
+                ),
+            );
+        }
         let service = PortService::new_for_tests("20260526");
         let response = match service
             .scan_loopback(
@@ -439,7 +466,7 @@ impl PortMcpServer {
             Ok(result) => self.ok("port_scan", json!({ "open_ports": result.open_ports })),
             Err(error) => self.err("port_scan", error),
         };
-        self.result(response)
+        self.result(started_at, response)
     }
 
     #[tool(description = "Connect a configured instance")]
@@ -447,9 +474,10 @@ impl PortMcpServer {
         &self,
         Parameters(params): Parameters<HandleParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let summary = self.with_app(|app| app.connect(&handle));
-        self.summary_response("port_connect", summary)
+        self.summary_response(started_at, "port_connect", summary)
     }
 
     #[tool(description = "Disconnect a connected instance")]
@@ -457,9 +485,10 @@ impl PortMcpServer {
         &self,
         Parameters(params): Parameters<HandleParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let summary = self.with_app(|app| app.disconnect(&handle));
-        self.summary_response("port_disconnect", summary)
+        self.summary_response(started_at, "port_disconnect", summary)
     }
 
     #[tool(description = "Queue bytes for sending")]
@@ -467,6 +496,7 @@ impl PortMcpServer {
         &self,
         Parameters(params): Parameters<PortSendParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let payload = match params.encoding {
             EncodingParam::Text => Payload::from_text(&params.data, params.append_line_break),
@@ -483,7 +513,7 @@ impl PortMcpServer {
                     .with_state(InstanceState::Connected),
                 Err(error) => self.err("port_send", error).with_handle(handle),
             };
-        self.result(response)
+        self.result(started_at, response)
     }
 
     #[tool(description = "Pull received bytes")]
@@ -491,6 +521,7 @@ impl PortMcpServer {
         &self,
         Parameters(params): Parameters<PortPullParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let response = match self.with_app(|app| app.pull(&handle, params.max_bytes)) {
             Ok(result) => self
@@ -506,7 +537,7 @@ impl PortMcpServer {
                 .with_state(InstanceState::Connected),
             Err(error) => self.err("port_pull", error).with_handle(handle),
         };
-        self.result(response)
+        self.result(started_at, response)
     }
 
     #[tool(description = "Clear tx/rx buffers")]
@@ -514,6 +545,7 @@ impl PortMcpServer {
         &self,
         Parameters(params): Parameters<PortClearParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let target = match params.target {
             ClearTargetParam::Tx => ClearTarget::Tx,
@@ -534,7 +566,7 @@ impl PortMcpServer {
                 .with_state(InstanceState::Connected),
             Err(error) => self.err("port_clear", error).with_handle(handle),
         };
-        self.result(response)
+        self.result(started_at, response)
     }
 
     #[tool(description = "Subscribe current MCP session to instance stream notifications")]
@@ -543,6 +575,7 @@ impl PortMcpServer {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<SubscribeParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let session_id = self.session_id(&context);
         let response = match self.with_app(|app| app.subscribe(&handle, &session_id, params.max_payload_bytes)) {
@@ -552,7 +585,7 @@ impl PortMcpServer {
                 .with_state(InstanceState::Connected),
             Err(error) => self.err("port_subscribe_stream", error).with_handle(handle),
         };
-        self.result(response)
+        self.result(started_at, response)
     }
 
     #[tool(description = "Unsubscribe current MCP session from instance stream notifications")]
@@ -561,6 +594,7 @@ impl PortMcpServer {
         context: RequestContext<RoleServer>,
         Parameters(params): Parameters<HandleParams>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let session_id = self.session_id(&context);
         let response = match self.with_app(|app| app.unsubscribe(&handle, &session_id)) {
@@ -569,11 +603,12 @@ impl PortMcpServer {
                 .with_handle(handle),
             Err(error) => self.err("port_unsubscribe_stream", error).with_handle(handle),
         };
-        self.result(response)
+        self.result(started_at, response)
     }
 
     fn summary_response(
         &self,
+        started_at: Instant,
         tool: &str,
         summary: Result<InstanceSummary, DomainError>,
     ) -> Result<CallToolResult, McpError> {
@@ -587,7 +622,7 @@ impl PortMcpServer {
                 .with_state(summary.state),
             Err(error) => self.err(tool, error),
         };
-        self.result(response)
+        self.result(started_at, response)
     }
 }
 
@@ -639,95 +674,6 @@ impl From<&str> for HandleId {
     fn from(value: &str) -> Self {
         Self::from_string(value)
     }
-}
-
-fn log_tool_response(response: &ToolResponse, duration_ms: u64) {
-    let event = tool_log_event(response, None, duration_ms);
-    tracing::info!(
-        event = event["event"].as_str().unwrap_or("tool_call"),
-        tool = event["tool"].as_str().unwrap_or_default(),
-        request_id = event["request_id"].as_str().unwrap_or_default(),
-        handle_id = event["handle_id"].as_str(),
-        session = event["session"].as_str(),
-        state_before = event["state_before"].as_str(),
-        state_after = event["state_after"].as_str(),
-        error_code = event["error_code"].as_str(),
-        duration_ms,
-        sensitive = false,
-        "port-mcp tool call completed"
-    );
-}
-
-fn tool_log_event(response: &ToolResponse, session: Option<&str>, duration_ms: u64) -> Value {
-    match serde_json::to_value(response).expect("tool response should serialize") {
-        Value::Object(fields) => tool_log_event_value(
-            fields
-                .get("tool")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            fields
-                .get("request_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            fields.get("handle_id").and_then(Value::as_str),
-            session,
-            fields.get("state").and_then(Value::as_str),
-            fields.get("state").and_then(Value::as_str),
-            fields
-                .get("error")
-                .and_then(|error| error.get("code"))
-                .and_then(Value::as_str),
-            duration_ms,
-        ),
-        _ => tool_log_event_value("", "", None, session, None, None, None, duration_ms),
-    }
-}
-
-fn tool_log_event_value(
-    tool: &str,
-    request_id: &str,
-    handle_id: Option<&str>,
-    session: Option<&str>,
-    state_before: Option<&str>,
-    state_after: Option<&str>,
-    error_code: Option<&str>,
-    duration_ms: u64,
-) -> Value {
-    json!({
-        "event": "tool_call",
-        "tool": tool,
-        "request_id": request_id,
-        "handle_id": handle_id,
-        "session": session,
-        "state_before": state_before,
-        "state_after": state_after,
-        "error_code": error_code,
-        "duration_ms": duration_ms,
-        "sensitive": false
-    })
-}
-
-#[cfg(test)]
-fn tool_log_event_for_tests(
-    tool: &str,
-    request_id: &str,
-    handle_id: Option<&str>,
-    session: Option<&str>,
-    state_before: Option<&str>,
-    state_after: Option<&str>,
-    error_code: Option<&str>,
-    duration_ms: u64,
-) -> Value {
-    tool_log_event_value(
-        tool,
-        request_id,
-        handle_id,
-        session,
-        state_before,
-        state_after,
-        error_code,
-        duration_ms,
-    )
 }
 
 #[tool_handler]
@@ -982,7 +928,7 @@ mod tests {
 
     #[test]
     fn m8_tool_log_event_contains_correlation_state_duration_and_sensitivity_fields() {
-        let event = super::tool_log_event_for_tests(
+        let event = crate::mcp::response::tool_log_event_for_tests(
             "port_send",
             "req_20260526_000123",
             Some("h_tcp_001"),
@@ -1003,6 +949,49 @@ mod tests {
         assert_eq!(event["error_code"], "WRITE_IO_FAILED");
         assert_eq!(event["duration_ms"], 7);
         assert_eq!(event["sensitive"], false);
+    }
+
+    #[tokio::test]
+    async fn m9_port_scan_rejects_timeout_above_runtime_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let response = call_tool_json(
+            &client,
+            "port_scan",
+            object!({
+                "host": "127.0.0.1",
+                "start_port": 9000,
+                "end_port": 9000,
+                "timeout_ms": 10_001
+            }),
+        )
+        .await?;
+
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "INVALID_RANGE");
+        assert_eq!(response["error"]["details"]["field"], "timeout_ms");
+        assert_eq!(response["error"]["details"]["max"], 10_000);
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
     }
 
     async fn call_tool_json(

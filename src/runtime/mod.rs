@@ -1,5 +1,11 @@
 #![allow(dead_code)]
 
+mod buffers;
+mod locks;
+mod queues;
+mod subscriptions;
+mod tasks;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::json;
@@ -9,6 +15,21 @@ use crate::model::{
     InstanceState, InstanceStats, InstanceSummary, InstanceType, LastErrorSummary, ResourceSummary,
     RuntimeLimits, SerialConfig, TcpConfig, Timestamp, UdpConfig, validate_instance_type,
 };
+
+#[allow(unused_imports)]
+pub use buffers::{ClearResult, ClearTarget, PullResult};
+#[allow(unused_imports)]
+pub use locks::{ResourceKey, ResourceLockState};
+#[allow(unused_imports)]
+pub use queues::{FlushResult, SendResult};
+#[allow(unused_imports)]
+pub use subscriptions::{Notification, SubscriptionResult, UnsubscribeResult};
+#[allow(unused_imports)]
+pub use tasks::{TaskExit, TaskGroup, TaskGroupState};
+
+use locks::{ResourceLockEntry, resource_lock_error};
+use queues::SendItem;
+use subscriptions::Subscriber;
 
 pub struct RuntimeRegistry {
     instances: HashMap<String, RuntimeInstance>,
@@ -290,15 +311,8 @@ impl RuntimeRegistry {
             return Err(resource_lock_error(&key, entry));
         }
 
-        self.resource_locks.insert(
-            key,
-            ResourceLockEntry {
-                owner_handle_id: owner_handle_id.clone(),
-                state: ResourceLockState::Held,
-                generation: 1,
-                stale_close: false,
-            },
-        );
+        self.resource_locks
+            .insert(key, ResourceLockEntry::held(owner_handle_id.clone()));
         Ok(())
     }
 
@@ -772,42 +786,6 @@ pub struct SessionBindingResult {
     pub previous_handle_id: Option<HandleId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ResourceKey(String);
-
-impl ResourceKey {
-    pub fn serial(port: &str) -> Self {
-        Self(format!("serial:{}", port.trim().to_ascii_uppercase()))
-    }
-
-    pub fn tcp_listen(host: &str, port: u16) -> Self {
-        Self(format!("tcp-listen:{}:{port}", normalize_host(host)))
-    }
-
-    pub fn udp_bind(host: &str, port: u16) -> Self {
-        Self(format!("udp-bind:{}:{port}", normalize_host(host)))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceLockState {
-    Held,
-    Closing,
-    Stale,
-}
-
-#[derive(Debug, Clone)]
-struct ResourceLockEntry {
-    owner_handle_id: HandleId,
-    state: ResourceLockState,
-    generation: u64,
-    stale_close: bool,
-}
-
 #[derive(Debug, Clone)]
 struct RuntimeInstance {
     handle_id: HandleId,
@@ -879,190 +857,6 @@ impl RuntimeInstance {
     }
 }
 
-#[derive(Debug, Clone)]
-struct SendItem {
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-struct Subscriber {
-    max_payload_bytes: usize,
-    queue: VecDeque<Notification>,
-    dropped_notifications: u64,
-    dropped_bytes: u64,
-    notification_tick: Option<u64>,
-    notifications_this_tick: u32,
-}
-
-impl Subscriber {
-    fn new(_session_id: &str, max_payload_bytes: usize) -> Self {
-        Self {
-            max_payload_bytes,
-            queue: VecDeque::new(),
-            dropped_notifications: 0,
-            dropped_bytes: 0,
-            notification_tick: None,
-            notifications_this_tick: 0,
-        }
-    }
-
-    fn queued_bytes(&self) -> usize {
-        self.queue
-            .iter()
-            .map(|notification| notification.payload.len())
-            .sum()
-    }
-
-    fn note_tick(&mut self, tick: u64, limit: u32) -> bool {
-        if self.notification_tick != Some(tick) {
-            self.notification_tick = Some(tick);
-            self.notifications_this_tick = 0;
-        }
-        self.notifications_this_tick >= limit
-    }
-
-    fn enqueue(
-        &mut self,
-        bytes: &[u8],
-        queue_limit: usize,
-        rate_limited: bool,
-    ) -> (usize, usize, u64) {
-        let payload_len = bytes.len().min(self.max_payload_bytes);
-        let payload = bytes[..payload_len].to_vec();
-        let truncated = payload_len < bytes.len();
-        if rate_limited {
-            let released = self.queued_bytes();
-            let dropped = self.queue.len().max(1) as u64;
-            self.queue.clear();
-            self.dropped_notifications += dropped;
-            self.dropped_bytes += bytes.len().saturating_sub(payload_len) as u64;
-            self.queue.push_back(Notification {
-                payload,
-                truncated,
-                coalesced: true,
-                dropped_notifications: self.dropped_notifications,
-            });
-            return (payload_len, released, dropped);
-        }
-
-        let mut released = 0;
-        let mut dropped = 0;
-        if self.queue.len() >= queue_limit {
-            if let Some(old) = self.queue.pop_front() {
-                released += old.payload.len();
-                dropped += 1;
-                self.dropped_notifications += 1;
-            }
-        }
-        self.dropped_bytes += bytes.len().saturating_sub(payload_len) as u64;
-        self.notifications_this_tick += 1;
-        self.queue.push_back(Notification {
-            payload,
-            truncated,
-            coalesced: false,
-            dropped_notifications: self.dropped_notifications,
-        });
-        (payload_len, released, dropped)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SendResult {
-    pub queued: bool,
-    pub sent_bytes: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlushResult {
-    pub frames: Vec<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PullResult {
-    pub bytes: Vec<u8>,
-    pub truncated: bool,
-    pub remaining_rx_buffer_bytes: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClearTarget {
-    Tx,
-    Rx,
-    All,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ClearResult {
-    pub dropped_tx_items: usize,
-    pub dropped_tx_bytes: usize,
-    pub dropped_rx_bytes: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubscriptionResult {
-    pub was_subscribed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnsubscribeResult {
-    pub was_subscribed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Notification {
-    pub payload: Vec<u8>,
-    pub truncated: bool,
-    pub coalesced: bool,
-    pub dropped_notifications: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskGroupState {
-    Running,
-    Cancelling,
-    Finished,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskExit {
-    Clean,
-    Failed(ErrorCode),
-}
-
-#[derive(Debug, Clone)]
-pub struct TaskGroup {
-    state: TaskGroupState,
-    exit: Option<TaskExit>,
-}
-
-impl TaskGroup {
-    pub fn new_for_tests() -> Self {
-        Self {
-            state: TaskGroupState::Running,
-            exit: None,
-        }
-    }
-
-    pub fn state(&self) -> TaskGroupState {
-        self.state
-    }
-
-    pub fn cancel(&mut self) {
-        if self.state == TaskGroupState::Running {
-            self.state = TaskGroupState::Cancelling;
-        }
-    }
-
-    pub fn finish(&mut self, exit: TaskExit) {
-        self.exit = Some(exit);
-        self.state = TaskGroupState::Finished;
-    }
-
-    pub fn exit(&self) -> Option<TaskExit> {
-        self.exit
-    }
-}
-
 fn resource_summary(config: &ConfigSnapshot) -> ResourceSummary {
     match config {
         ConfigSnapshot::Serial(config) => ResourceSummary::serial(&config.port),
@@ -1088,83 +882,6 @@ fn mock_resource_key(instance: &RuntimeInstance) -> Result<ResourceKey, DomainEr
             "Configure the instance before connecting mock transport.",
             false,
         )),
-    }
-}
-
-fn normalize_host(host: &str) -> String {
-    let trimmed = host.trim().to_ascii_lowercase();
-    if let Some(ipv4) = normalize_ipv4_with_leading_zeroes(&trimmed) {
-        return ipv4;
-    }
-    if let Ok(address) = trimmed.parse::<std::net::IpAddr>() {
-        address.to_string()
-    } else {
-        trimmed
-    }
-}
-
-fn normalize_ipv4_with_leading_zeroes(host: &str) -> Option<String> {
-    let parts = host.split('.').collect::<Vec<_>>();
-    if parts.len() != 4 {
-        return None;
-    }
-
-    let octets = parts
-        .iter()
-        .map(|part| part.parse::<u8>())
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    Some(format!(
-        "{}.{}.{}.{}",
-        octets[0], octets[1], octets[2], octets[3]
-    ))
-}
-
-fn resource_lock_error(key: &ResourceKey, entry: &ResourceLockEntry) -> DomainError {
-    let code = match entry.state {
-        ResourceLockState::Held => resource_busy_code(key),
-        ResourceLockState::Closing => ErrorCode::ResourceClosing,
-        ResourceLockState::Stale => ErrorCode::ResourceLockStale,
-    };
-    let message = match entry.state {
-        ResourceLockState::Held => "Resource is already owned by another instance.",
-        ResourceLockState::Closing => "Resource is still closing from a released instance.",
-        ResourceLockState::Stale => "Resource lock is stale and requires operator attention.",
-    };
-    DomainError::new(
-        ErrorCategory::ResourceBusy,
-        code,
-        message,
-        "Release the owning instance, wait for closing to complete, or choose another resource.",
-        matches!(entry.state, ResourceLockState::Closing),
-    )
-    .with_detail(
-        "resource",
-        json!({
-            "kind": resource_kind(key),
-            "display": key.as_str()
-        }),
-    )
-    .with_detail("owner_handle_id", json!(entry.owner_handle_id))
-}
-
-fn resource_busy_code(key: &ResourceKey) -> ErrorCode {
-    if key.as_str().starts_with("serial:") {
-        ErrorCode::SerialPortBusy
-    } else if key.as_str().starts_with("tcp-listen:") {
-        ErrorCode::TcpListenAddrBusy
-    } else {
-        ErrorCode::UdpBindAddrBusy
-    }
-}
-
-fn resource_kind(key: &ResourceKey) -> &'static str {
-    if key.as_str().starts_with("serial:") {
-        "serial"
-    } else if key.as_str().starts_with("tcp-listen:") {
-        "tcp-listen"
-    } else {
-        "udp-bind"
     }
 }
 
