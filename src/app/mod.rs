@@ -1,8 +1,11 @@
 #![allow(dead_code)]
 
 use crate::{
-    model::{DomainError, HandleId, InstanceSummary, InstanceType, SerialConfig, TcpConfig},
-    runtime::RuntimeRegistry,
+    model::{
+        DomainError, HandleId, InstanceSummary, InstanceType, Payload, PayloadSummary,
+        RuntimeLimits, SerialConfig, TcpConfig, UdpConfig,
+    },
+    runtime::{ClearResult, ClearTarget, PullResult, RuntimeRegistry, SendResult},
     transport::{ScanResult, port_scan_loopback},
 };
 
@@ -86,6 +89,72 @@ impl InstanceService {
         self.registry.configure_tcp(handle_id, config)
     }
 
+    pub fn configure_udp(
+        &mut self,
+        handle_id: &HandleId,
+        config: UdpConfig,
+    ) -> Result<InstanceSummary, DomainError> {
+        self.registry.configure_udp(handle_id, config)
+    }
+
+    pub fn connect(&mut self, handle_id: &HandleId) -> Result<InstanceSummary, DomainError> {
+        self.registry.connect_mock(handle_id)
+    }
+
+    pub fn disconnect(&mut self, handle_id: &HandleId) -> Result<InstanceSummary, DomainError> {
+        self.registry.disconnect_mock(handle_id)
+    }
+
+    pub fn send(
+        &mut self,
+        handle_id: &HandleId,
+        payload: &Payload,
+    ) -> Result<SendResult, DomainError> {
+        self.registry.port_send_mock(handle_id, &payload.bytes)
+    }
+
+    pub fn pull(
+        &mut self,
+        handle_id: &HandleId,
+        max_bytes: Option<usize>,
+    ) -> Result<PullResult, DomainError> {
+        match self.registry.port_pull_mock(handle_id, max_bytes) {
+            Ok(result) => Ok(result),
+            Err(error) if error.code == crate::model::ErrorCode::ReadTimeout => Ok(PullResult {
+                truncated: false,
+                remaining_rx_buffer_bytes: 0,
+                bytes: Vec::new(),
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn clear(
+        &mut self,
+        handle_id: &HandleId,
+        target: ClearTarget,
+    ) -> Result<ClearResult, DomainError> {
+        self.registry.port_clear_mock(handle_id, target)
+    }
+
+    pub fn subscribe(
+        &mut self,
+        handle_id: &HandleId,
+        session_id: &str,
+        max_payload_bytes: usize,
+    ) -> Result<crate::runtime::SubscriptionResult, DomainError> {
+        self.registry
+            .subscribe_mock(handle_id, session_id, max_payload_bytes)
+    }
+
+    pub fn unsubscribe(
+        &mut self,
+        handle_id: &HandleId,
+        session_id: &str,
+    ) -> Result<crate::runtime::UnsubscribeResult, DomainError> {
+        self.registry.unsubscribe_mock(handle_id, session_id)
+    }
+
     pub fn release(
         &mut self,
         handle_id: &HandleId,
@@ -111,5 +180,17 @@ impl PortService {
         timeout_ms: u64,
     ) -> Result<ScanResult, DomainError> {
         port_scan_loopback(host, start_port, end_port, max_concurrency, timeout_ms).await
+    }
+
+    pub fn summarize_payload(
+        bytes: &[u8],
+        encoding: crate::model::PayloadEncoding,
+    ) -> PayloadSummary {
+        PayloadSummary::from_bytes(
+            bytes,
+            encoding,
+            RuntimeLimits::default().pull_default_max_bytes,
+            false,
+        )
     }
 }

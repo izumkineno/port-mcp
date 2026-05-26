@@ -50,6 +50,10 @@ impl HandleId {
         Self(format!("h_{}_{sequence:03}", instance_type.handle_prefix()))
     }
 
+    pub fn from_string(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

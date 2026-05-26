@@ -1,12 +1,12 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionMode {
-    UnverifiedM0Spike,
+    RequestContextDebug,
 }
 
 impl SessionMode {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::UnverifiedM0Spike => "unverified_m0_spike",
+            Self::RequestContextDebug => "request_context_debug",
         }
     }
 }
