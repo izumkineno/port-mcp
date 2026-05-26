@@ -3,10 +3,37 @@
 use crate::{
     model::{DomainError, HandleId, InstanceSummary, InstanceType, SerialConfig, TcpConfig},
     runtime::RuntimeRegistry,
+    transport::{ScanResult, port_scan_loopback},
 };
 
 pub struct InstanceService {
     registry: RuntimeRegistry,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{model::ErrorCode, transport::TcpListenTransport};
+
+    #[tokio::test]
+    async fn unit_port_service_scans_loopback_and_preserves_scan_errors() {
+        let listener = TcpListenTransport::bind("127.0.0.1", 0).await.unwrap();
+        let open_port = listener.local_addr().port();
+        let service = PortService::new_for_tests("20260526");
+
+        let result = service
+            .scan_loopback("127.0.0.1", open_port, open_port, 4, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(result.open_ports, vec![open_port]);
+
+        let error = service
+            .scan_loopback("0.0.0.0", open_port, open_port, 4, 1_000)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ScanTargetNotAllowed);
+        listener.close().await.unwrap();
+    }
 }
 
 impl InstanceService {
@@ -65,5 +92,24 @@ impl InstanceService {
         force: bool,
     ) -> Result<InstanceSummary, DomainError> {
         self.registry.release_instance(handle_id, force)
+    }
+}
+
+pub struct PortService;
+
+impl PortService {
+    pub fn new_for_tests(_date: &str) -> Self {
+        Self
+    }
+
+    pub async fn scan_loopback(
+        &self,
+        host: &str,
+        start_port: u16,
+        end_port: u16,
+        max_concurrency: usize,
+        timeout_ms: u64,
+    ) -> Result<ScanResult, DomainError> {
+        port_scan_loopback(host, start_port, end_port, max_concurrency, timeout_ms).await
     }
 }
