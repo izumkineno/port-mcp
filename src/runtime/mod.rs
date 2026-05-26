@@ -14,6 +14,7 @@ pub struct RuntimeRegistry {
     instances: HashMap<String, RuntimeInstance>,
     released_handles: HashSet<String>,
     session_bindings: HashMap<String, HandleId>,
+    resource_locks: HashMap<ResourceKey, ResourceLockEntry>,
     ids: IdGenerator,
 }
 
@@ -23,6 +24,7 @@ impl RuntimeRegistry {
             instances: HashMap::new(),
             released_handles: HashSet::new(),
             session_bindings: HashMap::new(),
+            resource_locks: HashMap::new(),
             ids: IdGenerator::new_for_tests(date),
         }
     }
@@ -166,8 +168,34 @@ impl RuntimeRegistry {
         self.released_handles.insert(handle_id.as_str().to_owned());
         self.session_bindings
             .retain(|_, bound_handle_id| bound_handle_id.as_str() != handle_id.as_str());
+        self.release_or_close_owned_locks(handle_id, force);
 
         Ok(instance.released_summary())
+    }
+
+    pub fn acquire_resource_lock(
+        &mut self,
+        key: ResourceKey,
+        owner_handle_id: &HandleId,
+    ) -> Result<(), DomainError> {
+        if let Some(entry) = self.resource_locks.get(&key) {
+            return Err(resource_lock_error(&key, entry));
+        }
+
+        self.resource_locks.insert(
+            key,
+            ResourceLockEntry {
+                owner_handle_id: owner_handle_id.clone(),
+                state: ResourceLockState::Held,
+                generation: 1,
+                stale_close: false,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn resource_lock_state(&self, key: &ResourceKey) -> Option<ResourceLockState> {
+        self.resource_locks.get(key).map(|entry| entry.state)
     }
 
     fn configure(
@@ -194,6 +222,63 @@ impl RuntimeRegistry {
     ) -> Result<(), DomainError> {
         self.instance_mut(handle_id)?.state = state;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn move_resource_lock_to_closing_for_tests(
+        &mut self,
+        key: &ResourceKey,
+        owner_handle_id: &HandleId,
+    ) -> Result<(), DomainError> {
+        let entry = self.resource_locks.get_mut(key).ok_or_else(|| {
+            DomainError::new(
+                ErrorCategory::HandleNotFound,
+                ErrorCode::HandleNotFound,
+                "Resource lock does not exist.",
+                "Acquire the resource lock before moving it to closing.",
+                false,
+            )
+        })?;
+        if entry.owner_handle_id.as_str() != owner_handle_id.as_str() {
+            return Err(resource_lock_error(key, entry));
+        }
+        entry.state = ResourceLockState::Closing;
+        entry.generation += 1;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn mark_resource_lock_stale_for_tests(
+        &mut self,
+        key: &ResourceKey,
+    ) -> Result<(), DomainError> {
+        let entry = self.resource_locks.get_mut(key).ok_or_else(|| {
+            DomainError::new(
+                ErrorCategory::HandleNotFound,
+                ErrorCode::HandleNotFound,
+                "Resource lock does not exist.",
+                "Acquire the resource lock before marking it stale.",
+                false,
+            )
+        })?;
+        entry.state = ResourceLockState::Stale;
+        entry.stale_close = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn complete_resource_close_for_tests(
+        &mut self,
+        key: &ResourceKey,
+    ) -> Result<(), DomainError> {
+        match self.resource_locks.get(key) {
+            Some(entry) if entry.state == ResourceLockState::Closing => {
+                self.resource_locks.remove(key);
+                Ok(())
+            }
+            Some(entry) => Err(resource_lock_error(key, entry)),
+            None => Ok(()),
+        }
     }
 
     fn instance(&self, handle_id: &HandleId) -> Result<&RuntimeInstance, DomainError> {
@@ -227,11 +312,61 @@ impl RuntimeRegistry {
         )
         .with_detail("handle_id", json!(handle_id))
     }
+
+    fn release_or_close_owned_locks(&mut self, handle_id: &HandleId, force: bool) {
+        if force {
+            for entry in self.resource_locks.values_mut() {
+                if entry.owner_handle_id.as_str() == handle_id.as_str() {
+                    entry.state = ResourceLockState::Closing;
+                    entry.generation += 1;
+                }
+            }
+        } else {
+            self.resource_locks
+                .retain(|_, entry| entry.owner_handle_id.as_str() != handle_id.as_str());
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionBindingResult {
     pub previous_handle_id: Option<HandleId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResourceKey(String);
+
+impl ResourceKey {
+    pub fn serial(port: &str) -> Self {
+        Self(format!("serial:{}", port.trim().to_ascii_uppercase()))
+    }
+
+    pub fn tcp_listen(host: &str, port: u16) -> Self {
+        Self(format!("tcp-listen:{}:{port}", normalize_host(host)))
+    }
+
+    pub fn udp_bind(host: &str, port: u16) -> Self {
+        Self(format!("udp-bind:{}:{port}", normalize_host(host)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceLockState {
+    Held,
+    Closing,
+    Stale,
+}
+
+#[derive(Debug, Clone)]
+struct ResourceLockEntry {
+    owner_handle_id: HandleId,
+    state: ResourceLockState,
+    generation: u64,
+    stale_close: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +416,83 @@ fn resource_summary(config: &ConfigSnapshot) -> ResourceSummary {
             kind: "udp".to_owned(),
             display: format!("{}:{}", config.bind_host, config.bind_port),
         },
+    }
+}
+
+fn normalize_host(host: &str) -> String {
+    let trimmed = host.trim().to_ascii_lowercase();
+    if let Some(ipv4) = normalize_ipv4_with_leading_zeroes(&trimmed) {
+        return ipv4;
+    }
+    if let Ok(address) = trimmed.parse::<std::net::IpAddr>() {
+        address.to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn normalize_ipv4_with_leading_zeroes(host: &str) -> Option<String> {
+    let parts = host.split('.').collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return None;
+    }
+
+    let octets = parts
+        .iter()
+        .map(|part| part.parse::<u8>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(format!(
+        "{}.{}.{}.{}",
+        octets[0], octets[1], octets[2], octets[3]
+    ))
+}
+
+fn resource_lock_error(key: &ResourceKey, entry: &ResourceLockEntry) -> DomainError {
+    let code = match entry.state {
+        ResourceLockState::Held => resource_busy_code(key),
+        ResourceLockState::Closing => ErrorCode::ResourceClosing,
+        ResourceLockState::Stale => ErrorCode::ResourceLockStale,
+    };
+    let message = match entry.state {
+        ResourceLockState::Held => "Resource is already owned by another instance.",
+        ResourceLockState::Closing => "Resource is still closing from a released instance.",
+        ResourceLockState::Stale => "Resource lock is stale and requires operator attention.",
+    };
+    DomainError::new(
+        ErrorCategory::ResourceBusy,
+        code,
+        message,
+        "Release the owning instance, wait for closing to complete, or choose another resource.",
+        matches!(entry.state, ResourceLockState::Closing),
+    )
+    .with_detail(
+        "resource",
+        json!({
+            "kind": resource_kind(key),
+            "display": key.as_str()
+        }),
+    )
+    .with_detail("owner_handle_id", json!(entry.owner_handle_id))
+}
+
+fn resource_busy_code(key: &ResourceKey) -> ErrorCode {
+    if key.as_str().starts_with("serial:") {
+        ErrorCode::SerialPortBusy
+    } else if key.as_str().starts_with("tcp-listen:") {
+        ErrorCode::TcpListenAddrBusy
+    } else {
+        ErrorCode::UdpBindAddrBusy
+    }
+}
+
+fn resource_kind(key: &ResourceKey) -> &'static str {
+    if key.as_str().starts_with("serial:") {
+        "serial"
+    } else if key.as_str().starts_with("tcp-listen:") {
+        "tcp-listen"
+    } else {
+        "udp-bind"
     }
 }
 
@@ -450,6 +662,105 @@ mod tests {
 
         let released = registry.release_instance(&tcp.handle_id, true).unwrap();
         assert_eq!(released.state, InstanceState::Released);
+    }
+
+    #[test]
+    fn unit_resource_locks_normalize_keys_and_report_held_closing_stale_states() {
+        let mut registry = RuntimeRegistry::new_for_tests("20260526");
+        let owner = registry.create_instance(InstanceType::Serial).unwrap();
+        let contender = registry.create_instance(InstanceType::Serial).unwrap();
+
+        let serial_key = ResourceKey::serial(" com3 ");
+        assert_eq!(serial_key.as_str(), "serial:COM3");
+        assert_eq!(
+            ResourceKey::tcp_listen("127.000.000.001", 9000).as_str(),
+            "tcp-listen:127.0.0.1:9000"
+        );
+        assert_eq!(
+            ResourceKey::udp_bind("LOCALHOST", 9001).as_str(),
+            "udp-bind:localhost:9001"
+        );
+
+        registry
+            .acquire_resource_lock(serial_key.clone(), &owner.handle_id)
+            .unwrap();
+        assert_eq!(
+            registry.resource_lock_state(&serial_key).unwrap(),
+            ResourceLockState::Held
+        );
+
+        let busy = registry
+            .acquire_resource_lock(serial_key.clone(), &contender.handle_id)
+            .unwrap_err();
+        assert_eq!(busy.category, ErrorCategory::ResourceBusy);
+        assert_eq!(busy.code, ErrorCode::SerialPortBusy);
+
+        registry
+            .move_resource_lock_to_closing_for_tests(&serial_key, &owner.handle_id)
+            .unwrap();
+        assert_eq!(
+            registry.resource_lock_state(&serial_key).unwrap(),
+            ResourceLockState::Closing
+        );
+        let closing = registry
+            .acquire_resource_lock(serial_key.clone(), &contender.handle_id)
+            .unwrap_err();
+        assert_eq!(closing.code, ErrorCode::ResourceClosing);
+
+        registry
+            .mark_resource_lock_stale_for_tests(&serial_key)
+            .unwrap();
+        assert_eq!(
+            registry.resource_lock_state(&serial_key).unwrap(),
+            ResourceLockState::Stale
+        );
+        let stale = registry
+            .acquire_resource_lock(serial_key, &contender.handle_id)
+            .unwrap_err();
+        assert_eq!(stale.code, ErrorCode::ResourceLockStale);
+    }
+
+    #[test]
+    fn unit_release_lifecycle_moves_forced_connected_resources_to_closing_tombstone() {
+        let mut registry = RuntimeRegistry::new_for_tests("20260526");
+        let instance = registry.create_instance(InstanceType::Tcp).unwrap();
+        let key = ResourceKey::tcp_listen("127.0.0.1", 9000);
+
+        registry
+            .acquire_resource_lock(key.clone(), &instance.handle_id)
+            .unwrap();
+        registry
+            .set_state_for_tests(&instance.handle_id, InstanceState::Connected)
+            .unwrap();
+        registry
+            .use_instance(Some("session-a"), &instance.handle_id)
+            .unwrap();
+
+        let released = registry
+            .release_instance(&instance.handle_id, true)
+            .unwrap();
+        assert_eq!(released.state, InstanceState::Released);
+        assert_eq!(
+            registry.resource_lock_state(&key).unwrap(),
+            ResourceLockState::Closing
+        );
+        assert_eq!(
+            registry
+                .query_instance(&instance.handle_id)
+                .unwrap_err()
+                .code,
+            ErrorCode::HandleReleased
+        );
+        assert_eq!(
+            registry
+                .resolve_handle(None, Some("session-a"))
+                .unwrap_err()
+                .code,
+            ErrorCode::SessionBindingMissing
+        );
+
+        registry.complete_resource_close_for_tests(&key).unwrap();
+        assert!(registry.resource_lock_state(&key).is_none());
     }
 
     #[test]
