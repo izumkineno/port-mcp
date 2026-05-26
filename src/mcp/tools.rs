@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -56,6 +59,8 @@ impl PortMcpServer {
     }
 
     fn result(&self, response: ToolResponse) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        log_tool_response(&response, started_at.elapsed().as_millis() as u64);
         let text = serde_json::to_string(&response)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(text)]))
@@ -636,6 +641,95 @@ impl From<&str> for HandleId {
     }
 }
 
+fn log_tool_response(response: &ToolResponse, duration_ms: u64) {
+    let event = tool_log_event(response, None, duration_ms);
+    tracing::info!(
+        event = event["event"].as_str().unwrap_or("tool_call"),
+        tool = event["tool"].as_str().unwrap_or_default(),
+        request_id = event["request_id"].as_str().unwrap_or_default(),
+        handle_id = event["handle_id"].as_str(),
+        session = event["session"].as_str(),
+        state_before = event["state_before"].as_str(),
+        state_after = event["state_after"].as_str(),
+        error_code = event["error_code"].as_str(),
+        duration_ms,
+        sensitive = false,
+        "port-mcp tool call completed"
+    );
+}
+
+fn tool_log_event(response: &ToolResponse, session: Option<&str>, duration_ms: u64) -> Value {
+    match serde_json::to_value(response).expect("tool response should serialize") {
+        Value::Object(fields) => tool_log_event_value(
+            fields
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            fields
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            fields.get("handle_id").and_then(Value::as_str),
+            session,
+            fields.get("state").and_then(Value::as_str),
+            fields.get("state").and_then(Value::as_str),
+            fields
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str),
+            duration_ms,
+        ),
+        _ => tool_log_event_value("", "", None, session, None, None, None, duration_ms),
+    }
+}
+
+fn tool_log_event_value(
+    tool: &str,
+    request_id: &str,
+    handle_id: Option<&str>,
+    session: Option<&str>,
+    state_before: Option<&str>,
+    state_after: Option<&str>,
+    error_code: Option<&str>,
+    duration_ms: u64,
+) -> Value {
+    json!({
+        "event": "tool_call",
+        "tool": tool,
+        "request_id": request_id,
+        "handle_id": handle_id,
+        "session": session,
+        "state_before": state_before,
+        "state_after": state_after,
+        "error_code": error_code,
+        "duration_ms": duration_ms,
+        "sensitive": false
+    })
+}
+
+#[cfg(test)]
+fn tool_log_event_for_tests(
+    tool: &str,
+    request_id: &str,
+    handle_id: Option<&str>,
+    session: Option<&str>,
+    state_before: Option<&str>,
+    state_after: Option<&str>,
+    error_code: Option<&str>,
+    duration_ms: u64,
+) -> Value {
+    tool_log_event_value(
+        tool,
+        request_id,
+        handle_id,
+        session,
+        state_before,
+        state_after,
+        error_code,
+        duration_ms,
+    )
+}
+
 #[tool_handler]
 impl ServerHandler for PortMcpServer {}
 
@@ -884,6 +978,31 @@ mod tests {
         server_handle.await??;
 
         Ok(())
+    }
+
+    #[test]
+    fn m8_tool_log_event_contains_correlation_state_duration_and_sensitivity_fields() {
+        let event = super::tool_log_event_for_tests(
+            "port_send",
+            "req_20260526_000123",
+            Some("h_tcp_001"),
+            Some("mcp-session-1"),
+            Some("Connected"),
+            Some("Connected"),
+            Some("WRITE_IO_FAILED"),
+            7,
+        );
+
+        assert_eq!(event["event"], "tool_call");
+        assert_eq!(event["tool"], "port_send");
+        assert_eq!(event["request_id"], "req_20260526_000123");
+        assert_eq!(event["handle_id"], "h_tcp_001");
+        assert_eq!(event["session"], "mcp-session-1");
+        assert_eq!(event["state_before"], "Connected");
+        assert_eq!(event["state_after"], "Connected");
+        assert_eq!(event["error_code"], "WRITE_IO_FAILED");
+        assert_eq!(event["duration_ms"], 7);
+        assert_eq!(event["sensitive"], false);
     }
 
     async fn call_tool_json(
