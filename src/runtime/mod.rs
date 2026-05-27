@@ -725,13 +725,44 @@ impl RuntimeRegistry {
         Ok(())
     }
 
-    fn ensure_connected(&self, handle_id: &HandleId, tool: &str) -> Result<(), DomainError> {
+    pub fn ensure_connected(&self, handle_id: &HandleId, tool: &str) -> Result<(), DomainError> {
         let state = self.instance(handle_id)?.state;
         if state == InstanceState::Connected {
             Ok(())
         } else {
             Err(state_not_allowed(tool, state, &["Connected"]))
         }
+    }
+
+    pub fn validate_pull_max_bytes(&self, value: usize) -> Result<usize, DomainError> {
+        self.limits.validate_pull_max_bytes(value)
+    }
+
+    pub fn default_pull_max_bytes(&self) -> usize {
+        self.limits.pull_default_max_bytes
+    }
+
+    pub fn record_direct_tx(
+        &mut self,
+        handle_id: &HandleId,
+        bytes: usize,
+    ) -> Result<(), DomainError> {
+        let instance = self.instance_mut(handle_id)?;
+        instance.stats.tx_bytes += bytes as u64;
+        instance.stats.tx_queue_items = instance.tx_queue.len();
+        instance.stats.last_activity_at = Some(Timestamp::now_utc());
+        Ok(())
+    }
+
+    pub fn record_direct_rx(
+        &mut self,
+        handle_id: &HandleId,
+        bytes: usize,
+    ) -> Result<(), DomainError> {
+        let instance = self.instance_mut(handle_id)?;
+        instance.stats.rx_bytes += bytes as u64;
+        instance.stats.last_activity_at = Some(Timestamp::now_utc());
+        Ok(())
     }
 
     fn ensure_connected_or_error(

@@ -17,6 +17,11 @@ pub use tcp::{TcpClientTransport, TcpListenTransport};
 #[allow(unused_imports)]
 pub use udp::{UdpDatagram, UdpTransport};
 
+#[cfg(test)]
+pub(crate) fn serial_worker_for_tests(reads: Vec<Vec<u8>>) -> SerialWorker {
+    SerialWorker::start_for_tests(serial::ScriptedSerialDevice::new(reads))
+}
+
 pub(crate) use common::{
     ensure_loopback_host, map_read_error, map_tcp_bind_error, map_tcp_connect_error,
     map_udp_bind_error, map_write_error,

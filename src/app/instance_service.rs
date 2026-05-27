@@ -1,16 +1,21 @@
+use std::collections::HashMap;
+
 use crate::{
     model::{DomainError, HandleId, InstanceSummary, InstanceType},
     runtime::RuntimeRegistry,
+    transport::SerialWorker,
 };
 
 pub struct InstanceService {
     pub(crate) registry: RuntimeRegistry,
+    pub(crate) serial_workers: HashMap<String, SerialWorker>,
 }
 
 impl InstanceService {
     pub fn new_for_tests(date: &str) -> Self {
         Self {
             registry: RuntimeRegistry::new_for_tests(date),
+            serial_workers: HashMap::new(),
         }
     }
 
@@ -46,6 +51,24 @@ impl InstanceService {
         handle_id: &HandleId,
         force: bool,
     ) -> Result<InstanceSummary, DomainError> {
-        self.registry.release_instance(handle_id, force)
+        let summary = self.registry.release_instance(handle_id, force)?;
+        self.close_serial_worker(handle_id);
+        Ok(summary)
+    }
+
+    pub(crate) fn close_serial_worker(&mut self, handle_id: &HandleId) {
+        if let Some(worker) = self.serial_workers.remove(handle_id.as_str()) {
+            let _ = worker.close(1_000);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attach_serial_worker_for_tests(
+        &mut self,
+        handle_id: &HandleId,
+        worker: SerialWorker,
+    ) {
+        self.serial_workers
+            .insert(handle_id.as_str().to_owned(), worker);
     }
 }
