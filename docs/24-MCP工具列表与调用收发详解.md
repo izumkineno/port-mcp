@@ -326,21 +326,48 @@ UDP 示例：
 
 ### `port_scan`
 
-用途：扫描允许范围内的 loopback TCP 端口。初版只允许 loopback 单主机，不支持非 loopback、CIDR、通配地址或 DNS 扫描。
+用途：按 `type` 选择串口枚举或允许范围内的 loopback TCP/UDP 端口扫描。初版网络扫描只允许 loopback 单主机，不支持非 loopback、CIDR、通配地址或 DNS 扫描。
 
 入参：
 
 ```json
 {
-  "host": "127.0.0.1",
-  "start_port": 9000,
-  "end_port": 9010,
-  "max_concurrency": 16,
-  "timeout_ms": 1000
+  "type": "Serial",
+  "config": {}
+}
+```
+
+```json
+{
+  "type": "TCP",
+  "config": {
+    "host": "127.0.0.1",
+    "start_port": 9000,
+    "end_port": 9010,
+    "max_concurrency": 16,
+    "timeout_ms": 1000
+  }
 }
 ```
 
 成功返回重点：
+
+```json
+{
+  "ok": true,
+  "tool": "port_scan",
+  "data": {
+    "resources": [
+      {
+        "name": "COM3",
+        "display": "usb vid=1a86 pid=7523",
+        "port_type": "usb vid=1a86 pid=7523"
+      }
+    ]
+  },
+  "warnings": []
+}
+```
 
 ```json
 {

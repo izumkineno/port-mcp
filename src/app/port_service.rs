@@ -4,7 +4,7 @@ use crate::{
         PayloadSummary, RuntimeLimits,
     },
     runtime::{ClearResult, ClearTarget, PullResult, SendResult},
-    transport::{ScanResult, port_scan_loopback},
+    transport::{ScanResult, SerialPortSummary, port_scan_loopback, scan_serial_ports},
 };
 
 use super::InstanceService;
@@ -67,6 +67,18 @@ impl PortService {
         timeout_ms: u64,
     ) -> Result<ScanResult, DomainError> {
         port_scan_loopback(host, start_port, end_port, max_concurrency, timeout_ms).await
+    }
+
+    pub fn scan_serial(&self) -> Result<Vec<SerialPortSummary>, DomainError> {
+        scan_serial_ports().map_err(|error| {
+            DomainError::new(
+                error.category,
+                error.code,
+                error.message,
+                "Check serial device permissions and driver state, then retry port_scan.",
+                false,
+            )
+        })
     }
 
     pub fn summarize_payload(bytes: &[u8], encoding: PayloadEncoding) -> PayloadSummary {

@@ -167,9 +167,20 @@ impl Default for TcpModeParam {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PortScanParams {
-    host: String,
-    start_port: u16,
-    end_port: u16,
+    #[serde(rename = "type")]
+    scan_type: InstanceTypeParam,
+    #[serde(default)]
+    config: PortScanConfigParams,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct PortScanConfigParams {
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    start_port: Option<u16>,
+    #[serde(default)]
+    end_port: Option<u16>,
     #[serde(default = "default_scan_concurrency")]
     max_concurrency: usize,
     #[serde(default = "default_timeout_ms")]
@@ -434,8 +445,29 @@ impl PortMcpServer {
         Parameters(params): Parameters<PortScanParams>,
     ) -> Result<CallToolResult, McpError> {
         let started_at = Instant::now();
+        match params.scan_type {
+            InstanceTypeParam::Serial => {
+                let service = PortService::new_for_tests("20260526");
+                let response = match service.scan_serial() {
+                    Ok(resources) => self.ok("port_scan", json!({ "resources": resources })),
+                    Err(error) => self.err("port_scan", error),
+                };
+                self.result(started_at, response)
+            }
+            InstanceTypeParam::Tcp | InstanceTypeParam::Udp => {
+                let response = self.port_scan_network(started_at, params.config).await?;
+                Ok(response)
+            }
+        }
+    }
+
+    async fn port_scan_network(
+        &self,
+        started_at: Instant,
+        config: PortScanConfigParams,
+    ) -> Result<CallToolResult, McpError> {
         let limits = RuntimeLimits::default();
-        if params.timeout_ms == 0 || params.timeout_ms > limits.scan_total_timeout_ms {
+        if config.timeout_ms == 0 || config.timeout_ms > limits.scan_total_timeout_ms {
             return self.result(
                 started_at,
                 self.err(
@@ -448,18 +480,27 @@ impl PortMcpServer {
                     .with_detail("field", json!("timeout_ms"))
                     .with_detail("min", json!(1))
                     .with_detail("max", json!(limits.scan_total_timeout_ms))
-                    .with_detail("actual", json!(params.timeout_ms)),
+                    .with_detail("actual", json!(config.timeout_ms)),
                 ),
             );
         }
+        let Some(host) = config.host else {
+            return self.result(started_at, self.missing_scan_config_field("host"));
+        };
+        let Some(start_port) = config.start_port else {
+            return self.result(started_at, self.missing_scan_config_field("start_port"));
+        };
+        let Some(end_port) = config.end_port else {
+            return self.result(started_at, self.missing_scan_config_field("end_port"));
+        };
         let service = PortService::new_for_tests("20260526");
         let response = match service
             .scan_loopback(
-                &params.host,
-                params.start_port,
-                params.end_port,
-                params.max_concurrency,
-                params.timeout_ms,
+                &host,
+                start_port,
+                end_port,
+                config.max_concurrency,
+                config.timeout_ms,
             )
             .await
         {
@@ -467,6 +508,18 @@ impl PortMcpServer {
             Err(error) => self.err("port_scan", error),
         };
         self.result(started_at, response)
+    }
+
+    fn missing_scan_config_field(&self, field: &str) -> ToolResponse {
+        self.err(
+            "port_scan",
+            DomainError::invalid_argument(
+                ErrorCode::MissingRequiredField,
+                format!("port_scan config.{field} is required for network scans."),
+                "Pass host, start_port, and end_port inside config for TCP or UDP scans.",
+            )
+            .with_detail("field", json!(field)),
+        )
     }
 
     #[tool(description = "Connect a configured instance")]
@@ -975,10 +1028,13 @@ mod tests {
             &client,
             "port_scan",
             object!({
-                "host": "127.0.0.1",
-                "start_port": 9000,
-                "end_port": 9000,
-                "timeout_ms": 10_001
+                "type": "TCP",
+                "config": {
+                    "host": "127.0.0.1",
+                    "start_port": 9000,
+                    "end_port": 9000,
+                    "timeout_ms": 10_001
+                }
             }),
         )
         .await?;
@@ -987,6 +1043,57 @@ mod tests {
         assert_eq!(response["error"]["code"], "INVALID_RANGE");
         assert_eq!(response["error"]["details"]["field"], "timeout_ms");
         assert_eq!(response["error"]["details"]["max"], 10_000);
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_port_scan_routes_by_type_config() -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let serial = call_tool_json(
+            &client,
+            "port_scan",
+            object!({ "type": "Serial", "config": {} }),
+        )
+        .await?;
+        assert_eq!(serial["ok"], true);
+        assert!(serial["data"]["resources"].is_array());
+
+        let tcp = call_tool_json(
+            &client,
+            "port_scan",
+            object!({
+                "type": "TCP",
+                "config": {
+                    "host": "127.0.0.1",
+                    "start_port": 9000,
+                    "end_port": 9000,
+                    "timeout_ms": 1000
+                }
+            }),
+        )
+        .await?;
+        assert_eq!(tcp["ok"], true);
+        assert!(tcp["data"]["open_ports"].is_array());
 
         client.cancel().await?;
         server_handle.await??;

@@ -10,10 +10,11 @@ use std::{
 use crate::model::{
     DataBits, ErrorCategory, ErrorCode, FlowControl, Parity, SerialConfig, StopBits,
 };
+use serde::Serialize;
 
 use super::TransportError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SerialPortSummary {
     pub name: String,
     pub display: String,
