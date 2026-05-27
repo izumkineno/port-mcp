@@ -15,7 +15,6 @@ use crate::model::{
     InstanceState, InstanceStats, InstanceSummary, InstanceType, LastErrorSummary, ResourceSummary,
     RuntimeLimits, SerialConfig, TcpConfig, Timestamp, UdpConfig, validate_instance_type,
 };
-
 #[allow(unused_imports)]
 pub use buffers::{ClearResult, ClearTarget, PullResult};
 #[allow(unused_imports)]
@@ -225,8 +224,9 @@ impl RuntimeRegistry {
                 &["Configured", "Disconnected"],
             ));
         }
-        let key = mock_resource_key(instance)?;
-        self.acquire_resource_lock(key, handle_id)?;
+        if let Some(key) = mock_resource_key(instance)? {
+            self.acquire_resource_lock(key, handle_id)?;
+        }
 
         let instance = self.instance_mut(handle_id)?;
         instance.task_group = Some(TaskGroup::new_for_tests());
@@ -891,21 +891,32 @@ impl RuntimeInstance {
 fn resource_summary(config: &ConfigSnapshot) -> ResourceSummary {
     match config {
         ConfigSnapshot::Serial(config) => ResourceSummary::serial(&config.port),
-        ConfigSnapshot::Tcp(config) => ResourceSummary::tcp(&config.host, config.port),
-        ConfigSnapshot::Udp(config) => ResourceSummary {
-            kind: "udp".to_owned(),
-            display: format!("{}:{}", config.bind_host, config.bind_port),
+        ConfigSnapshot::Tcp(config) => match config.mode {
+            crate::model::TcpMode::Client => ResourceSummary::tcp_client(&config.host, config.port),
+            crate::model::TcpMode::Listen => ResourceSummary::tcp_listen(&config.host, config.port),
         },
+        ConfigSnapshot::Udp(config) => ResourceSummary::udp(
+            &config.bind_host,
+            config.bind_port,
+            config.remote_host.as_deref(),
+            config.remote_port,
+        ),
     }
 }
 
-fn mock_resource_key(instance: &RuntimeInstance) -> Result<ResourceKey, DomainError> {
+fn mock_resource_key(instance: &RuntimeInstance) -> Result<Option<ResourceKey>, DomainError> {
     match &instance.config {
-        Some(ConfigSnapshot::Serial(config)) => Ok(ResourceKey::serial(&config.port)),
-        Some(ConfigSnapshot::Tcp(config)) => Ok(ResourceKey::tcp_listen(&config.host, config.port)),
-        Some(ConfigSnapshot::Udp(config)) => {
-            Ok(ResourceKey::udp_bind(&config.bind_host, config.bind_port))
-        }
+        Some(ConfigSnapshot::Serial(config)) => Ok(Some(ResourceKey::serial(&config.port))),
+        Some(ConfigSnapshot::Tcp(config)) => match config.mode {
+            crate::model::TcpMode::Client => Ok(None),
+            crate::model::TcpMode::Listen => {
+                Ok(Some(ResourceKey::tcp_listen(&config.host, config.port)))
+            }
+        },
+        Some(ConfigSnapshot::Udp(config)) => Ok(Some(ResourceKey::udp_bind(
+            &config.bind_host,
+            config.bind_port,
+        ))),
         None => Err(DomainError::new(
             ErrorCategory::InvalidState,
             ErrorCode::ConfigRequired,
@@ -1262,7 +1273,15 @@ mod tests {
         let mut registry = RuntimeRegistry::new_for_tests("20260526");
         let instance = registry.create_instance(InstanceType::Tcp).unwrap();
         registry
-            .configure_tcp(&instance.handle_id, TcpConfig::client("127.0.0.1", 9000))
+            .configure_tcp(
+                &instance.handle_id,
+                TcpConfig {
+                    mode: crate::model::TcpMode::Listen,
+                    host: "127.0.0.1".to_owned(),
+                    port: 9000,
+                    timeout_ms: 1_000,
+                },
+            )
             .unwrap();
         registry.connect_mock(&instance.handle_id).unwrap();
 

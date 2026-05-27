@@ -32,9 +32,38 @@ impl ResourceSummary {
     }
 
     pub fn tcp(host: &str, port: u16) -> Self {
+        Self::tcp_client(host, port)
+    }
+
+    pub fn tcp_client(host: &str, port: u16) -> Self {
         Self {
-            kind: "tcp".to_owned(),
+            kind: "tcp-client".to_owned(),
             display: format!("{host}:{port}"),
+        }
+    }
+
+    pub fn tcp_listen(host: &str, port: u16) -> Self {
+        Self {
+            kind: "tcp-listen".to_owned(),
+            display: format!("{host}:{port}"),
+        }
+    }
+
+    pub fn udp(
+        bind_host: &str,
+        bind_port: u16,
+        remote_host: Option<&str>,
+        remote_port: Option<u16>,
+    ) -> Self {
+        let display = match (remote_host, remote_port) {
+            (Some(remote_host), Some(remote_port)) => {
+                format!("{bind_host}:{bind_port} -> {remote_host}:{remote_port}")
+            }
+            _ => format!("{bind_host}:{bind_port}"),
+        };
+        Self {
+            kind: "udp".to_owned(),
+            display,
         }
     }
 }
@@ -126,16 +155,7 @@ impl TcpConfig {
     }
 
     pub fn validate_remote(&self) -> Result<(), DomainError> {
-        if matches!(self.host.as_str(), "0.0.0.0" | "::" | "") {
-            Err(DomainError::invalid_argument(
-                ErrorCode::InvalidAddress,
-                "Address is not valid for a remote endpoint.",
-                "Use a concrete loopback or remote host address.",
-            )
-            .with_detail("field", json!("host")))
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 }
 

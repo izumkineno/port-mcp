@@ -13,9 +13,9 @@ pub use mock::MockTransport;
 #[allow(unused_imports)]
 pub use serial::{SerialPortSettings, SerialPortSummary, SerialWorker, scan_serial_ports};
 #[allow(unused_imports)]
-pub use tcp::{TcpClientTransport, TcpListenTransport};
+pub use tcp::{TcpClientTransport, TcpClientWorker, TcpListenTransport, TcpListenWorker};
 #[allow(unused_imports)]
-pub use udp::{UdpDatagram, UdpTransport};
+pub use udp::{UdpDatagram, UdpTransport, UdpWorker};
 
 #[cfg(test)]
 pub(crate) fn serial_worker_for_tests(reads: Vec<Vec<u8>>) -> SerialWorker {
@@ -23,9 +23,9 @@ pub(crate) fn serial_worker_for_tests(reads: Vec<Vec<u8>>) -> SerialWorker {
 }
 
 pub(crate) use common::{
-    ensure_loopback_host, map_read_error, map_tcp_bind_error, map_tcp_connect_error,
-    map_udp_bind_error, map_write_error,
+    map_read_error, map_tcp_bind_error, map_tcp_connect_error, map_udp_bind_error, map_write_error,
 };
+pub(crate) use udp::resolve_udp_peer;
 
 #[cfg(test)]
 mod tests {
@@ -89,6 +89,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn integration_tcp_transport_accepts_non_loopback_hosts_before_network_failure() {
+        let client_error = TcpClientTransport::connect("192.0.2.1", 1, 1_000)
+            .await
+            .unwrap_err();
+        assert_ne!(client_error.code, ErrorCode::InvalidAddress);
+
+        let bind_error = TcpListenTransport::bind("192.0.2.10", 0).await.unwrap_err();
+        assert_ne!(bind_error.code, ErrorCode::InvalidAddress);
+    }
+
+    #[tokio::test]
     async fn integration_tcp_listen_rejects_address_conflict_and_allows_reuse_after_close() {
         let listener = TcpListenTransport::bind("127.0.0.1", 0).await.unwrap();
         let address = listener.local_addr();
@@ -136,6 +147,27 @@ mod tests {
             .await
             .unwrap();
         rebound.close().await.unwrap();
+    }
+
+    #[test]
+    fn integration_udp_worker_loopback_datagrams_round_trip() {
+        let server = UdpWorker::bind("127.0.0.1", 0, 1_000).unwrap();
+        let client = UdpWorker::bind("127.0.0.1", 0, 1_000).unwrap();
+
+        assert_eq!(client.send_to(b"ping", server.local_addr()).unwrap(), 4);
+        assert_eq!(server.recv(16).unwrap(), b"ping".to_vec());
+
+        assert_eq!(server.send_to(b"pong", client.local_addr()).unwrap(), 4);
+        assert_eq!(client.recv(16).unwrap(), b"pong".to_vec());
+
+        server.close().unwrap();
+        client.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn integration_udp_transport_accepts_non_loopback_hosts_before_network_failure() {
+        let bind_error = UdpTransport::bind("192.0.2.10", 0).await.unwrap_err();
+        assert_ne!(bind_error.code, ErrorCode::InvalidAddress);
     }
 
     #[tokio::test]

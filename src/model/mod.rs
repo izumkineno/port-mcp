@@ -81,7 +81,7 @@ mod tests {
         assert_eq!(value["state"], "Configured");
         assert_eq!(
             value["resource"],
-            json!({ "kind": "tcp", "display": "127.0.0.1:9000" })
+            json!({ "kind": "tcp-client", "display": "127.0.0.1:9000" })
         );
         assert_eq!(value["stats"]["rx_buffer_bytes"], 0);
         assert_eq!(
@@ -123,11 +123,8 @@ mod tests {
             ErrorCode::TypeMismatch
         );
         assert_eq!(
-            TcpConfig::client("0.0.0.0", 9000)
-                .validate_remote()
-                .unwrap_err()
-                .code,
-            ErrorCode::InvalidAddress
+            TcpConfig::client("0.0.0.0", 9000).validate_remote().is_ok(),
+            true
         );
     }
 

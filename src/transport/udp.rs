@@ -1,10 +1,14 @@
-use std::{net::SocketAddr, time::Duration};
-
-use tokio::{net::UdpSocket, time::timeout};
-
-use super::{
-    TransportError, ensure_loopback_host, map_read_error, map_udp_bind_error, map_write_error,
+use std::{
+    net::SocketAddr,
+    net::ToSocketAddrs,
+    sync::mpsc,
+    thread::{self, JoinHandle},
+    time::Duration,
 };
+
+use tokio::{net::UdpSocket, runtime::Builder, time::timeout};
+
+use super::{TransportError, map_read_error, map_udp_bind_error, map_write_error};
 
 #[derive(Debug)]
 pub struct UdpTransport {
@@ -13,7 +17,6 @@ pub struct UdpTransport {
 
 impl UdpTransport {
     pub async fn bind(host: &str, port: u16) -> Result<Self, TransportError> {
-        ensure_loopback_host(host)?;
         let address = format!("{host}:{port}");
         let socket = UdpSocket::bind(&address)
             .await
@@ -61,9 +64,156 @@ impl UdpTransport {
     }
 }
 
+#[derive(Debug)]
+pub struct UdpWorker {
+    commands: mpsc::Sender<UdpCommand>,
+    _thread: JoinHandle<()>,
+    timeout_ms: u64,
+    local_addr: SocketAddr,
+}
+
+impl UdpWorker {
+    pub fn bind(host: &str, port: u16, timeout_ms: u64) -> Result<Self, TransportError> {
+        let host = host.to_owned();
+        let (commands, receiver) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let runtime = transport_runtime();
+            let result = runtime.block_on(UdpTransport::bind(&host, port));
+            match result {
+                Ok(transport) => {
+                    let local_addr = transport.local_addr();
+                    let _ = ready_tx.send(Ok(local_addr));
+                    run_udp_worker(runtime, transport, timeout_ms, receiver);
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                }
+            }
+        });
+        match ready_rx.recv_timeout(Duration::from_millis(timeout_ms.saturating_add(1_000))) {
+            Ok(Ok(local_addr)) => Ok(Self {
+                commands,
+                _thread: thread,
+                timeout_ms,
+                local_addr,
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(TransportError::connect_timeout(
+                "udp worker initialization timed out",
+            )),
+        }
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn send_to(&self, bytes: &[u8], peer: SocketAddr) -> Result<usize, TransportError> {
+        self.request(|reply| UdpCommand::Send(bytes.to_vec(), peer, reply))
+    }
+
+    pub fn recv(&self, max_bytes: usize) -> Result<Vec<u8>, TransportError> {
+        self.request(|reply| UdpCommand::Recv(max_bytes, reply))
+    }
+
+    pub fn close(&self) -> Result<(), TransportError> {
+        self.request(UdpCommand::Close)
+    }
+
+    fn request<T>(
+        &self,
+        build: impl FnOnce(mpsc::Sender<Result<T, TransportError>>) -> UdpCommand,
+    ) -> Result<T, TransportError> {
+        let (reply, receiver) = mpsc::channel();
+        self.commands
+            .send(build(reply))
+            .map_err(|_| TransportError::transport_closed("udp worker is closed"))?;
+        receive_worker_reply(receiver, self.timeout_ms)
+    }
+}
+
+enum UdpCommand {
+    Send(
+        Vec<u8>,
+        SocketAddr,
+        mpsc::Sender<Result<usize, TransportError>>,
+    ),
+    Recv(usize, mpsc::Sender<Result<Vec<u8>, TransportError>>),
+    Close(mpsc::Sender<Result<(), TransportError>>),
+}
+
+fn transport_runtime() -> tokio::runtime::Runtime {
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("transport runtime should be constructible")
+}
+
+fn run_udp_worker(
+    runtime: tokio::runtime::Runtime,
+    mut transport: UdpTransport,
+    timeout_ms: u64,
+    receiver: mpsc::Receiver<UdpCommand>,
+) {
+    for command in receiver {
+        match command {
+            UdpCommand::Send(bytes, peer, reply) => {
+                let result = runtime.block_on(async {
+                    timeout(
+                        Duration::from_millis(timeout_ms),
+                        transport.send_to(&bytes, peer),
+                    )
+                    .await
+                    .map_err(|_| {
+                        TransportError::write_failed(
+                            crate::model::ErrorCode::WriteIoFailed,
+                            "udp send timed out",
+                        )
+                    })?
+                });
+                let _ = reply.send(result);
+            }
+            UdpCommand::Recv(max_bytes, reply) => {
+                let result = runtime.block_on(async {
+                    timeout(
+                        Duration::from_millis(timeout_ms),
+                        transport.recv_datagram(max_bytes, timeout_ms),
+                    )
+                    .await
+                    .map_err(|_| TransportError::read_timeout("udp receive timed out"))?
+                    .map(|datagram| datagram.bytes)
+                });
+                let _ = reply.send(result);
+            }
+            UdpCommand::Close(reply) => {
+                let _ = reply.send(runtime.block_on(transport.close()));
+                break;
+            }
+        }
+    }
+}
+
+fn receive_worker_reply<T>(
+    receiver: mpsc::Receiver<Result<T, TransportError>>,
+    timeout_ms: u64,
+) -> Result<T, TransportError> {
+    receiver
+        .recv_timeout(Duration::from_millis(timeout_ms))
+        .map_err(|_| TransportError::read_timeout("udp worker response timed out"))?
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdpDatagram {
     pub bytes: Vec<u8>,
     pub peer: SocketAddr,
     pub datagram: bool,
+}
+
+pub(crate) fn resolve_udp_peer(host: &str, port: u16) -> Result<SocketAddr, TransportError> {
+    (host, port)
+        .to_socket_addrs()
+        .map_err(|_| TransportError::invalid_address("udp remote endpoint is invalid"))?
+        .next()
+        .ok_or_else(|| TransportError::invalid_address("udp remote endpoint is invalid"))
 }

@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{io, thread, time::Duration};
 
 use tokio::{net::TcpStream, time::timeout};
 
@@ -134,22 +134,27 @@ pub async fn port_scan_loopback(
     Ok(ScanResult { open_ports })
 }
 
-pub(crate) fn ensure_loopback_host(host: &str) -> Result<(), TransportError> {
-    if is_loopback_single_host(host) {
-        Ok(())
-    } else {
-        Err(TransportError::invalid_address(
-            "network transport is restricted to loopback during M5",
-        ))
-    }
-}
-
 fn is_loopback_single_host(host: &str) -> bool {
     let trimmed = host.trim();
     trimmed
         .parse::<std::net::IpAddr>()
         .map(|address| address.is_loopback() && !matches!(trimmed, "0.0.0.0" | "::"))
         .unwrap_or(false)
+}
+
+pub(crate) fn run_in_new_thread<T>(
+    label: &'static str,
+    operation: impl FnOnce() -> Result<T, TransportError> + Send + 'static,
+) -> Result<T, TransportError>
+where
+    T: Send + 'static,
+{
+    thread::spawn(operation).join().map_err(|_| {
+        TransportError::write_failed(
+            ErrorCode::TaskFailed,
+            format!("{label} initialization panicked"),
+        )
+    })?
 }
 
 pub(crate) fn map_tcp_connect_error(error: io::Error) -> TransportError {

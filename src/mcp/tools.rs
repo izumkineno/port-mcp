@@ -85,6 +85,22 @@ impl PortMcpServer {
         operation(&mut app)
     }
 
+    async fn with_app_blocking<T>(
+        &self,
+        operation: impl FnOnce(&mut InstanceService) -> T + Send + 'static,
+    ) -> T
+    where
+        T: Send + 'static,
+    {
+        let app = self.app.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut app = app.lock().expect("app service mutex poisoned");
+            operation(&mut app)
+        })
+        .await
+        .expect("blocking app task should complete")
+    }
+
     fn session_id(&self, context: &RequestContext<RoleServer>) -> String {
         format!("mcp-session-{:#?}", context.id)
     }
@@ -634,7 +650,9 @@ impl PortMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
-        let summary = self.with_app(|app| app.connect(&handle));
+        let summary = self
+            .with_app_blocking(move |app| app.connect(&handle))
+            .await;
         self.summary_response(started_at, "port_connect", summary)
     }
 
@@ -647,7 +665,9 @@ impl PortMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
-        let summary = self.with_app(|app| app.disconnect(&handle));
+        let summary = self
+            .with_app_blocking(move |app| app.disconnect(&handle))
+            .await;
         self.summary_response(started_at, "port_disconnect", summary)
     }
 
@@ -660,6 +680,7 @@ impl PortMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
+        let handle_for_app = handle.clone();
         let payload = match params.encoding {
             EncodingParam::Text => Payload::from_text(&params.data, params.append_line_break),
             EncodingParam::Hex => Payload::from_hex(&params.data, params.append_line_break),
@@ -668,7 +689,10 @@ impl PortMcpServer {
             Ok(payload) => {
                 let port_io =
                     PortIoLog::new(PortIoDirection::Tx, payload.bytes.clone(), payload.encoding);
-                let response = match self.with_app(|app| app.send(&handle, &payload)) {
+                let response = match self
+                    .with_app_blocking(move |app| app.send(&handle_for_app, &payload))
+                    .await
+                {
                     Ok(result) => self
                         .ok(
                             "port_send",
@@ -694,7 +718,11 @@ impl PortMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
-        let response = match self.with_app(|app| app.pull(&handle, params.max_bytes)) {
+        let handle_for_app = handle.clone();
+        let response = match self
+            .with_app_blocking(move |app| app.pull(&handle_for_app, params.max_bytes))
+            .await
+        {
             Ok(result) => {
                 let port_io = PortIoLog::new(
                     PortIoDirection::Rx,
@@ -912,7 +940,13 @@ mod tests {
         model::{CallToolRequestParams, CallToolResult},
         object,
     };
-    use tokio::sync::Notify;
+    use tokio::{
+        io::AsyncReadExt,
+        io::AsyncWriteExt,
+        net::{TcpListener, UdpSocket},
+        sync::Notify,
+        time::{Duration, timeout},
+    };
 
     use super::PortMcpServer;
 
@@ -1075,6 +1109,16 @@ mod tests {
     #[tokio::test]
     async fn m7_e2e_smoke_covers_instance_config_port_and_release_tools()
     -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listen_port = listener.local_addr()?.port();
+        let receive_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut buffer = vec![0; 4];
+            stream.read_exact(&mut buffer).await?;
+            stream.write_all(b"pong").await?;
+            Ok::<(), std::io::Error>(())
+        });
+
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
 
         let server_handle = tokio::spawn(async move {
@@ -1103,7 +1147,7 @@ mod tests {
                 "handle_id": handle_id,
                 "mode": "client",
                 "host": "127.0.0.1",
-                "port": 9000,
+                "port": listen_port,
                 "timeout_ms": 1000
             }),
         )
@@ -1123,15 +1167,16 @@ mod tests {
             .await?["data"]["sent_bytes"],
             4
         );
-        assert_eq!(
-            call_tool_json(
-                &client,
-                "port_pull",
-                object!({ "handle_id": handle_id, "max_bytes": 16 })
-            )
-            .await?["ok"],
-            true
-        );
+        let pulled = call_tool_json(
+            &client,
+            "port_pull",
+            object!({ "handle_id": handle_id, "max_bytes": 16 }),
+        )
+        .await?;
+        assert_eq!(pulled["data"]["payload"]["preview"], "pong");
+        timeout(Duration::from_secs(5), receive_task)
+            .await
+            .expect("listener should receive ping")??;
         assert_eq!(
             call_tool_json(
                 &client,
@@ -1158,8 +1203,235 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn r1_mcp_tcp_client_send_reaches_real_loopback_listener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listen_port = listener.local_addr()?.port();
+        let receive_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut buffer = vec![0; 4];
+            stream.read_exact(&mut buffer).await?;
+            Ok::<Vec<u8>, std::io::Error>(buffer)
+        });
+
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let created =
+            call_tool_json(&client, "instance_create", object!({ "type": "TCP" })).await?;
+        let handle_id = created["handle_id"].as_str().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            call_tool_json(
+                &client,
+                "tcp_udp_config",
+                object!({
+                    "handle_id": handle_id,
+                    "mode": "client",
+                    "host": "127.0.0.1",
+                    "port": listen_port,
+                    "timeout_ms": 1000
+                }),
+            )
+            .await
+        })
+        .await
+        .expect("tcp_udp_config should complete")?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            call_tool_json(&client, "port_connect", object!({ "handle_id": handle_id })).await
+        })
+        .await
+        .expect("port_connect should complete")?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            call_tool_json(
+                &client,
+                "port_send",
+                object!({ "handle_id": handle_id, "data": "ping", "encoding": "text" }),
+            )
+            .await
+        })
+        .await
+        .expect("port_send should complete")?;
+
+        let received = timeout(Duration::from_millis(500), receive_task)
+            .await
+            .expect("real TCP listener should receive bytes from MCP port_send")??;
+        assert_eq!(received, b"ping");
+
+        assert_eq!(
+            call_tool_json(
+                &client,
+                "port_disconnect",
+                object!({ "handle_id": handle_id })
+            )
+            .await?["state"],
+            "Disconnected"
+        );
+        assert_eq!(
+            call_tool_json(
+                &client,
+                "instance_release",
+                object!({ "handle_id": handle_id })
+            )
+            .await?["state"],
+            "Released"
+        );
+
+        client.cancel().await?;
+        tokio::time::timeout(Duration::from_secs(5), server_handle)
+            .await
+            .expect("MCP server should stop after client cancellation")??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn r1_mcp_udp_send_reaches_real_loopback_listener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = UdpSocket::bind("127.0.0.1:0").await?;
+        let listen_port = listener.local_addr()?.port();
+        let receive_task = tokio::spawn(async move {
+            let mut buffer = vec![0; 16];
+            let (read, _) = listener.recv_from(&mut buffer).await?;
+            buffer.truncate(read);
+            Ok::<Vec<u8>, std::io::Error>(buffer)
+        });
+
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let created =
+            call_tool_json(&client, "instance_create", object!({ "type": "UDP" })).await?;
+        let handle_id = created["handle_id"].as_str().unwrap();
+
+        call_tool_json(
+            &client,
+            "tcp_udp_config",
+            object!({
+                "handle_id": handle_id,
+                "bind_host": "127.0.0.1",
+                "bind_port": 0,
+                "remote_host": "127.0.0.1",
+                "remote_port": listen_port,
+                "timeout_ms": 1000
+            }),
+        )
+        .await?;
+        call_tool_json(&client, "port_connect", object!({ "handle_id": handle_id })).await?;
+        assert_eq!(
+            call_tool_json(
+                &client,
+                "port_send",
+                object!({ "handle_id": handle_id, "data": "ping", "encoding": "text" }),
+            )
+            .await?["data"]["sent_bytes"],
+            4
+        );
+
+        let received = timeout(Duration::from_millis(500), receive_task)
+            .await
+            .expect("real UDP listener should receive bytes from MCP port_send")??;
+        assert_eq!(received, b"ping");
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn r1_mcp_udp_listener_receives_real_loopback_datagram()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let created =
+            call_tool_json(&client, "instance_create", object!({ "type": "UDP" })).await?;
+        let handle_id = created["handle_id"].as_str().unwrap();
+        call_tool_json(
+            &client,
+            "tcp_udp_config",
+            object!({
+                "handle_id": handle_id,
+                "bind_host": "127.0.0.1",
+                "bind_port": 18091,
+                "timeout_ms": 1000
+            }),
+        )
+        .await?;
+        call_tool_json(&client, "port_connect", object!({ "handle_id": handle_id })).await?;
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await?;
+        sender.send_to(b"pong", "127.0.0.1:18091").await?;
+
+        let pulled = call_tool_json(
+            &client,
+            "port_pull",
+            object!({ "handle_id": handle_id, "max_bytes": 16 }),
+        )
+        .await?;
+        assert_eq!(pulled["data"]["payload"]["preview"], "pong");
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn m7_request_context_is_reflected_in_subscription_response()
     -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listen_port = listener.local_addr()?.port();
+        let receive_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut buffer = vec![0; 4];
+            stream.read_exact(&mut buffer).await?;
+            Ok::<(), std::io::Error>(())
+        });
+
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
 
         let server_handle = tokio::spawn(async move {
@@ -1183,10 +1455,19 @@ mod tests {
         call_tool_json(
             &client,
             "tcp_udp_config",
-            object!({ "handle_id": handle_id, "mode": "client", "host": "127.0.0.1", "port": 9000 }),
+            object!({ "handle_id": handle_id, "mode": "client", "host": "127.0.0.1", "port": listen_port }),
         )
         .await?;
         call_tool_json(&client, "port_connect", object!({ "handle_id": handle_id })).await?;
+        call_tool_json(
+            &client,
+            "port_send",
+            object!({ "handle_id": handle_id, "data": "ping", "encoding": "text" }),
+        )
+        .await?;
+        timeout(Duration::from_secs(5), receive_task)
+            .await
+            .expect("listener should receive ping")??;
 
         let subscribed = call_tool_json(
             &client,
@@ -1195,7 +1476,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(subscribed["request_id"], "req_20260526_000004");
+        assert_eq!(subscribed["request_id"], "req_20260526_000005");
         assert_eq!(subscribed["data"]["session_mode"], "request_context_debug");
 
         client.cancel().await?;
