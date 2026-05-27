@@ -88,6 +88,63 @@ impl PortMcpServer {
     fn session_id(&self, context: &RequestContext<RoleServer>) -> String {
         format!("mcp-session-{:#?}", context.id)
     }
+
+    fn usage_guide_data() -> Value {
+        json!({
+            "purpose": "Help a new MCP agent use port-mcp correctly when only tool metadata is available.",
+            "principles": [
+                "Always pass handle_id explicitly after instance_create; do not rely on session defaults unless you intentionally called instance_use.",
+                "Normal lifecycle is create -> configure -> connect -> send/pull or subscribe -> disconnect -> release.",
+                "Use port_scan before serial_config when the serial port name is unknown.",
+                "Use debug_log_config only when troubleshooting raw I/O logs; port_io_log_bytes=0 disables raw I/O logging."
+            ],
+            "common_sequences": {
+                "tcp_client": [
+                    { "tool": "instance_create", "arguments": { "type": "TCP" } },
+                    { "tool": "tcp_udp_config", "arguments": { "handle_id": "<handle_id>", "mode": "client", "host": "127.0.0.1", "port": 9000, "timeout_ms": 1000 } },
+                    { "tool": "port_connect", "arguments": { "handle_id": "<handle_id>" } },
+                    { "tool": "port_send", "arguments": { "handle_id": "<handle_id>", "data": "ping", "encoding": "text" } },
+                    { "tool": "port_pull", "arguments": { "handle_id": "<handle_id>", "max_bytes": 64 } },
+                    { "tool": "port_disconnect", "arguments": { "handle_id": "<handle_id>" } },
+                    { "tool": "instance_release", "arguments": { "handle_id": "<handle_id>" } }
+                ],
+                "tcp_listen": [
+                    { "tool": "instance_create", "arguments": { "type": "TCP" } },
+                    { "tool": "tcp_udp_config", "arguments": { "handle_id": "<handle_id>", "mode": "listen", "bind_host": "127.0.0.1", "bind_port": 9000, "timeout_ms": 1000 } },
+                    { "tool": "port_connect", "arguments": { "handle_id": "<handle_id>" } }
+                ],
+                "udp": [
+                    { "tool": "instance_create", "arguments": { "type": "UDP" } },
+                    { "tool": "tcp_udp_config", "arguments": { "handle_id": "<handle_id>", "bind_host": "127.0.0.1", "bind_port": 9001, "remote_host": "127.0.0.1", "remote_port": 9002, "timeout_ms": 1000 } },
+                    { "tool": "port_connect", "arguments": { "handle_id": "<handle_id>" } }
+                ],
+                "serial": [
+                    { "tool": "port_scan", "arguments": { "type": "Serial", "config": {} } },
+                    { "tool": "instance_create", "arguments": { "type": "Serial" } },
+                    { "tool": "serial_config", "arguments": { "handle_id": "<handle_id>", "port": "COM3", "baudrate": 115200, "data_bits": "Eight", "stop_bits": "One", "parity": "None", "flow_control": "None", "timeout_ms": 1000 } },
+                    { "tool": "port_connect", "arguments": { "handle_id": "<handle_id>" } }
+                ]
+            },
+            "tool_notes": {
+                "instance_create": "Create a Serial, TCP, or UDP instance. Save data.summary.handle_id or handle_id from the response.",
+                "instance_list": "List unreleased instances and their states; useful before choosing a handle_id.",
+                "instance_query": "Inspect one instance. Prefer passing handle_id explicitly.",
+                "instance_use": "Optional session convenience. Avoid for portable automation unless the client has stable session identity.",
+                "instance_release": "Release an instance after disconnect. If state is Connected, pass force=true only when cleanup is intended.",
+                "serial_config": "Configure only Serial instances. Required fields: handle_id and port. Common port examples: COM3, /dev/ttyUSB0.",
+                "tcp_udp_config": "Configure TCP or UDP instances. TCP client uses host/port; TCP listen uses mode=listen plus bind_host/bind_port; UDP uses bind_host/bind_port and optional remote_host/remote_port.",
+                "port_scan": "Serial scan accepts type=Serial and empty config. TCP/UDP scans require loopback host, start_port, and end_port in config.",
+                "port_connect": "Open the configured Serial/TCP/UDP resource. Requires state Configured or Disconnected.",
+                "port_disconnect": "Close a Connected instance while keeping its config for later reconnect.",
+                "port_send": "Send data on a Connected instance. encoding is text or hex; append_line_break defaults to false.",
+                "port_pull": "Read received bytes from a Connected instance. max_bytes is optional and bounded by runtime limits.",
+                "port_clear": "Clear tx, rx, or all buffers. target defaults to all.",
+                "port_subscribe_stream": "Subscribe current MCP session to receive stream notifications for a Connected instance.",
+                "port_unsubscribe_stream": "Cancel a prior stream subscription for the current MCP session.",
+                "debug_log_config": "Set raw I/O preview bytes in logs. Use 0 to disable; maximum is 65536."
+            }
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -320,7 +377,17 @@ fn default_subscriber_payload_bytes() -> usize {
 
 #[tool_router]
 impl PortMcpServer {
-    #[tool(description = "Create a Serial, TCP, or UDP port instance")]
+    #[tool(
+        description = "Return a machine-readable quickstart for new agents: lifecycle, common call sequences, required handle_id usage, and per-tool notes. Call this first when no external documentation is available."
+    )]
+    pub async fn usage_guide(&self) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        self.result(started_at, self.ok("usage_guide", Self::usage_guide_data()))
+    }
+
+    #[tool(
+        description = "Create a Serial, TCP, or UDP instance without opening the resource. First step of every workflow; save the returned handle_id for all later calls."
+    )]
     pub async fn instance_create(
         &self,
         Parameters(params): Parameters<InstanceCreateParams>,
@@ -330,7 +397,9 @@ impl PortMcpServer {
         self.summary_response(started_at, "instance_create", summary)
     }
 
-    #[tool(description = "List active port instances")]
+    #[tool(
+        description = "List all unreleased instances with handle_id, type, state, resource summary, and counters. Use when choosing or recovering a handle_id."
+    )]
     pub async fn instance_list(&self) -> Result<CallToolResult, McpError> {
         let started_at = Instant::now();
         let instances = self.with_app(|app| app.list());
@@ -340,7 +409,9 @@ impl PortMcpServer {
         )
     }
 
-    #[tool(description = "Query an instance by handle id or current session default")]
+    #[tool(
+        description = "Query one instance state, config, counters, buffers, subscribers, and last error. Prefer passing handle_id explicitly; omitted handle_id uses the current session default if available."
+    )]
     pub async fn instance_query(
         &self,
         context: RequestContext<RoleServer>,
@@ -353,7 +424,9 @@ impl PortMcpServer {
         self.summary_response(started_at, "instance_query", summary)
     }
 
-    #[tool(description = "Bind an instance as the current session default")]
+    #[tool(
+        description = "Optionally bind handle_id as this MCP session's default instance. For reliable automation, still prefer explicit handle_id on later tools."
+    )]
     pub async fn instance_use(
         &self,
         context: RequestContext<RoleServer>,
@@ -375,7 +448,9 @@ impl PortMcpServer {
         self.result(started_at, response)
     }
 
-    #[tool(description = "Release an instance")]
+    #[tool(
+        description = "Release an instance and remove it from instance_list. Disconnect first; use force=true only when intentionally releasing a Connected instance."
+    )]
     pub async fn instance_release(
         &self,
         Parameters(params): Parameters<InstanceReleaseParams>,
@@ -386,7 +461,9 @@ impl PortMcpServer {
         self.summary_response(started_at, "instance_release", summary)
     }
 
-    #[tool(description = "Configure a Serial instance")]
+    #[tool(
+        description = "Configure a Serial instance before port_connect. Required: handle_id and port such as COM3 or /dev/ttyUSB0. Defaults: baudrate=115200, data_bits=Eight, stop_bits=One, parity=None, flow_control=None, encoding=text."
+    )]
     pub async fn serial_config(
         &self,
         Parameters(params): Parameters<SerialConfigParams>,
@@ -407,7 +484,9 @@ impl PortMcpServer {
         self.summary_response(started_at, "serial_config", summary)
     }
 
-    #[tool(description = "Configure a TCP or UDP instance")]
+    #[tool(
+        description = "Configure a TCP or UDP instance before port_connect. TCP client uses mode=client, host, port. TCP listen uses mode=listen, bind_host, bind_port. UDP uses bind_host, bind_port, and optional remote_host/remote_port."
+    )]
     pub async fn tcp_udp_config(
         &self,
         Parameters(params): Parameters<TcpUdpConfigParams>,
@@ -461,7 +540,9 @@ impl PortMcpServer {
         self.summary_response(started_at, "tcp_udp_config", summary)
     }
 
-    #[tool(description = "Scan allowed loopback TCP ports")]
+    #[tool(
+        description = "Scan available resources. For Serial, pass type=Serial and config={}. For TCP/UDP, pass loopback config with host, start_port, end_port, optional max_concurrency and timeout_ms."
+    )]
     pub async fn port_scan(
         &self,
         Parameters(params): Parameters<PortScanParams>,
@@ -544,7 +625,9 @@ impl PortMcpServer {
         )
     }
 
-    #[tool(description = "Connect a configured instance")]
+    #[tool(
+        description = "Open a Configured or Disconnected instance so it can send, pull, or subscribe. Requires explicit handle_id."
+    )]
     pub async fn port_connect(
         &self,
         Parameters(params): Parameters<HandleParams>,
@@ -555,7 +638,9 @@ impl PortMcpServer {
         self.summary_response(started_at, "port_connect", summary)
     }
 
-    #[tool(description = "Disconnect a connected instance")]
+    #[tool(
+        description = "Close a Connected instance while keeping its configuration for reconnect or release. Requires explicit handle_id."
+    )]
     pub async fn port_disconnect(
         &self,
         Parameters(params): Parameters<HandleParams>,
@@ -566,7 +651,9 @@ impl PortMcpServer {
         self.summary_response(started_at, "port_disconnect", summary)
     }
 
-    #[tool(description = "Queue bytes for sending")]
+    #[tool(
+        description = "Send payload on a Connected instance. Required: handle_id and data. encoding defaults to text; use encoding=hex for hexadecimal bytes. append_line_break defaults to false."
+    )]
     pub async fn port_send(
         &self,
         Parameters(params): Parameters<PortSendParams>,
@@ -598,7 +685,9 @@ impl PortMcpServer {
         self.result(started_at, response)
     }
 
-    #[tool(description = "Pull received bytes")]
+    #[tool(
+        description = "Pull received bytes from a Connected instance rx buffer. Required: handle_id. Optional max_bytes controls returned payload summary size within runtime limits."
+    )]
     pub async fn port_pull(
         &self,
         Parameters(params): Parameters<PortPullParams>,
@@ -629,7 +718,9 @@ impl PortMcpServer {
         self.result(started_at, response)
     }
 
-    #[tool(description = "Configure debug log display scope")]
+    #[tool(
+        description = "Configure raw port I/O preview in server logs for troubleshooting port_send and port_pull. port_io_log_bytes=0 disables raw I/O logging; maximum is 65536."
+    )]
     pub async fn debug_log_config(
         &self,
         Parameters(params): Parameters<DebugLogConfigParams>,
@@ -667,7 +758,9 @@ impl PortMcpServer {
         )
     }
 
-    #[tool(description = "Clear tx/rx buffers")]
+    #[tool(
+        description = "Clear buffered data for an instance. Required: handle_id. target defaults to all; valid targets are tx, rx, and all."
+    )]
     pub async fn port_clear(
         &self,
         Parameters(params): Parameters<PortClearParams>,
@@ -696,7 +789,9 @@ impl PortMcpServer {
         self.result(started_at, response)
     }
 
-    #[tool(description = "Subscribe current MCP session to instance stream notifications")]
+    #[tool(
+        description = "Subscribe the current MCP session to receive stream notifications for a Connected instance. Required: handle_id. Optional max_payload_bytes defaults to 16384."
+    )]
     pub async fn port_subscribe_stream(
         &self,
         context: RequestContext<RoleServer>,
@@ -715,7 +810,9 @@ impl PortMcpServer {
         self.result(started_at, response)
     }
 
-    #[tool(description = "Unsubscribe current MCP session from instance stream notifications")]
+    #[tool(
+        description = "Unsubscribe the current MCP session from stream notifications for an instance. Required: handle_id. Repeated unsubscribe returns was_subscribed=false."
+    )]
     pub async fn port_unsubscribe_stream(
         &self,
         context: RequestContext<RoleServer>,
@@ -854,6 +951,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
 
         for expected in [
+            "usage_guide",
             "instance_create",
             "instance_list",
             "instance_query",
@@ -874,6 +972,58 @@ mod tests {
             assert!(tool_names.contains(expected), "missing tool {expected}");
         }
         assert!(!tool_names.contains("m0_smoke"));
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_usage_guide_returns_agent_onboarding_sequences()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let response = call_tool_json(&client, "usage_guide", object!({})).await?;
+
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["tool"], "usage_guide");
+        assert_eq!(response["request_id"], "req_20260526_000001");
+        assert!(
+            response["data"]["principles"][0]
+                .as_str()
+                .unwrap()
+                .contains("handle_id explicitly")
+        );
+        assert_eq!(
+            response["data"]["common_sequences"]["tcp_client"][0]["tool"],
+            "instance_create"
+        );
+        assert_eq!(
+            response["data"]["common_sequences"]["serial"][0]["tool"],
+            "port_scan"
+        );
+        assert!(
+            response["data"]["tool_notes"]["tcp_udp_config"]
+                .as_str()
+                .unwrap()
+                .contains("TCP client uses host/port")
+        );
 
         client.cancel().await?;
         server_handle.await??;
