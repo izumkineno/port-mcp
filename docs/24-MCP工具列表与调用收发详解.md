@@ -6,7 +6,7 @@
 
 ## 当前工具总览
 
-当前 stdio MCP server 暴露 15 个初版工具，分为 4 组。
+当前 stdio MCP server 暴露 16 个初版工具，分为 5 组。
 
 | 分组 | 工具 | 主要用途 | 实现入口 |
 | --- | --- | --- | --- |
@@ -25,6 +25,7 @@
 | 端口行为 | `port_clear` | 清理 tx、rx 或全部缓冲。 | `PortMcpServer::port_clear` |
 | 最小流式订阅 | `port_subscribe_stream` | 订阅当前会话的实例接收通知。 | `PortMcpServer::port_subscribe_stream` |
 | 最小流式订阅 | `port_unsubscribe_stream` | 取消当前会话的实例接收通知。 | `PortMcpServer::port_unsubscribe_stream` |
+| 调试配置 | `debug_log_config` | 设置调试日志中的端口原始收发数据显示范围。 | `PortMcpServer::debug_log_config` |
 
 ## MCP 调用外形
 
@@ -101,9 +102,15 @@ MCP 客户端调用工具时，传入的是工具名和 JSON object 参数。以
 | `state_before` / `state_after` | 当前 response state | 当前实现用返回 state 作为状态摘要。 |
 | `error_code` | `error.code` | 失败时的细分错误码。 |
 | `duration_ms` | handler 起点到响应包装 | 工具处理耗时，包含 app/runtime 调用和响应包装前的主要路径。 |
-| `sensitive` | 固定 false | 工具调用日志摘要不携带敏感 payload。 |
+| `sensitive` | 固定 false | 工具调用基础日志不携带敏感 payload；端口原始收发数据只在显式打开显示范围后写入 `port_io`。 |
+| `port_io.direction` | `port_send` / `port_pull` | `tx` 表示发送，`rx` 表示接收。仅当 `debug_log_config.port_io_log_bytes > 0` 时出现。 |
+| `port_io.bytes` | 原始收发字节 | 本次发送或拉取的总字节数。 |
+| `port_io.preview_encoding` | 调用编码 | `text` 或 `hex`；hex 发送按十六进制字符串显示。 |
+| `port_io.preview` | 原始收发数据预览 | 按 `port_io_log_bytes` 截断后的 text 或 hex 字符串。 |
+| `port_io.hex` | 原始收发数据十六进制 | 同一段预览字节的十六进制字符串，便于二进制排查。 |
+| `port_io.omitted_bytes` | 截断计算 | 超过显示范围而未写入日志的字节数。 |
 
-真实串口、TCP、UDP 的底层收发由 `transport` 层封装；MCP 工具层只接收 JSON 参数、调用 `app` 服务、返回摘要。`port_send` 返回发送字节数和是否入队；`port_pull` 返回 payload 摘要，不直接返回无限制原始数据。
+真实串口、TCP、UDP 的底层收发由 `transport` 层封装；MCP 工具层只接收 JSON 参数、调用 `app` 服务、返回摘要。`port_send` 返回发送字节数和是否入队；`port_pull` 返回 payload 摘要，不直接返回无限制原始数据。调试日志默认不展示原始收发数据；需要排查时先调用 `debug_log_config` 设置显示字节数，设置为 `0` 可关闭。
 
 ## 通用参数类型
 
@@ -592,6 +599,33 @@ Hex 示例：
 ```
 
 错误边界：句柄不存在或 session 不可用。重复取消订阅应按运行时订阅语义返回 `was_subscribed=false`，而不是业务失败。
+
+### `debug_log_config`
+
+用途：设置调试日志中 `port_send` 和 `port_pull` 的原始收发数据显示范围。该配置为当前 MCP server 进程内存态，默认 `port_io_log_bytes=0`，即不在日志中写原始收发数据。
+
+入参：
+
+```json
+{
+  "port_io_log_bytes": 64
+}
+```
+
+成功返回重点：
+
+```json
+{
+  "ok": true,
+  "tool": "debug_log_config",
+  "data": {
+    "port_io_log_bytes": 64
+  },
+  "warnings": []
+}
+```
+
+错误边界：`port_io_log_bytes` 最大为 `65536`；超过上限返回 `INVALID_RANGE`。设置为 `0` 会关闭原始收发数据日志。
 
 ## 推荐调用序列
 

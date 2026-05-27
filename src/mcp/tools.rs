@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::{
     app::{InstanceService, PortService},
-    mcp::response,
+    mcp::response::{self, PortIoDirection, PortIoLog, PortIoLogConfig},
     mcp::session::SessionMode,
     model::{
         DataBits, DomainError, ErrorCode, FlowControl, HandleId, IdGenerator, InstanceState,
@@ -26,6 +26,7 @@ use crate::{
 pub struct PortMcpServer {
     app: Arc<Mutex<InstanceService>>,
     ids: Arc<Mutex<IdGenerator>>,
+    port_io_log_config: Arc<Mutex<PortIoLogConfig>>,
 }
 
 impl PortMcpServer {
@@ -37,6 +38,7 @@ impl PortMcpServer {
         Self {
             app: Arc::new(Mutex::new(InstanceService::new_for_tests(date))),
             ids: Arc::new(Mutex::new(IdGenerator::new_for_tests(date))),
+            port_io_log_config: Arc::new(Mutex::new(PortIoLogConfig::default())),
         }
     }
 
@@ -62,6 +64,20 @@ impl PortMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         response::call_tool_result_with_duration(response, duration_ms)
+    }
+
+    fn result_with_port_io(
+        &self,
+        started_at: Instant,
+        response: ToolResponse,
+        port_io: Option<PortIoLog>,
+    ) -> Result<CallToolResult, McpError> {
+        let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let config = *self
+            .port_io_log_config
+            .lock()
+            .expect("port io log config mutex poisoned");
+        response::call_tool_result_with_duration_and_io(response, duration_ms, config, port_io)
     }
 
     fn with_app<T>(&self, operation: impl FnOnce(&mut InstanceService) -> T) -> T {
@@ -215,6 +231,12 @@ pub struct SubscribeParams {
     handle_id: String,
     #[serde(default = "default_subscriber_payload_bytes")]
     max_payload_bytes: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DebugLogConfigParams {
+    #[serde(default)]
+    port_io_log_bytes: usize,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -555,17 +577,24 @@ impl PortMcpServer {
             EncodingParam::Text => Payload::from_text(&params.data, params.append_line_break),
             EncodingParam::Hex => Payload::from_hex(&params.data, params.append_line_break),
         };
-        let response =
-            match payload.and_then(|payload| self.with_app(|app| app.send(&handle, &payload))) {
-                Ok(result) => self
-                    .ok(
-                        "port_send",
-                        json!({ "queued": result.queued, "sent_bytes": result.sent_bytes }),
-                    )
-                    .with_handle(handle)
-                    .with_state(InstanceState::Connected),
-                Err(error) => self.err("port_send", error).with_handle(handle),
-            };
+        let response = match payload {
+            Ok(payload) => {
+                let port_io =
+                    PortIoLog::new(PortIoDirection::Tx, payload.bytes.clone(), payload.encoding);
+                let response = match self.with_app(|app| app.send(&handle, &payload)) {
+                    Ok(result) => self
+                        .ok(
+                            "port_send",
+                            json!({ "queued": result.queued, "sent_bytes": result.sent_bytes }),
+                        )
+                        .with_handle(handle)
+                        .with_state(InstanceState::Connected),
+                    Err(error) => self.err("port_send", error).with_handle(handle),
+                };
+                return self.result_with_port_io(started_at, response, Some(port_io));
+            }
+            Err(error) => self.err("port_send", error).with_handle(handle),
+        };
         self.result(started_at, response)
     }
 
@@ -577,8 +606,13 @@ impl PortMcpServer {
         let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let response = match self.with_app(|app| app.pull(&handle, params.max_bytes)) {
-            Ok(result) => self
-                .ok(
+            Ok(result) => {
+                let port_io = PortIoLog::new(
+                    PortIoDirection::Rx,
+                    result.bytes.clone(),
+                    PayloadEncoding::Text,
+                );
+                let response = self.ok(
                     "port_pull",
                     json!({
                         "payload": PortService::summarize_payload(&result.bytes, PayloadEncoding::Text),
@@ -587,10 +621,50 @@ impl PortMcpServer {
                     }),
                 )
                 .with_handle(handle)
-                .with_state(InstanceState::Connected),
+                .with_state(InstanceState::Connected);
+                return self.result_with_port_io(started_at, response, Some(port_io));
+            }
             Err(error) => self.err("port_pull", error).with_handle(handle),
         };
         self.result(started_at, response)
+    }
+
+    #[tool(description = "Configure debug log display scope")]
+    pub async fn debug_log_config(
+        &self,
+        Parameters(params): Parameters<DebugLogConfigParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let max_allowed = 65_536usize;
+        if params.port_io_log_bytes > max_allowed {
+            return self.result(
+                started_at,
+                self.err(
+                    "debug_log_config",
+                    DomainError::invalid_argument(
+                        ErrorCode::InvalidRange,
+                        "debug_log_config port_io_log_bytes is outside the allowed range.",
+                        "Use a value between 0 and 65536 bytes.",
+                    )
+                    .with_detail("field", json!("port_io_log_bytes"))
+                    .with_detail("max", json!(max_allowed))
+                    .with_detail("actual", json!(params.port_io_log_bytes)),
+                ),
+            );
+        }
+        *self
+            .port_io_log_config
+            .lock()
+            .expect("port io log config mutex poisoned") = PortIoLogConfig {
+            max_bytes: params.port_io_log_bytes,
+        };
+        self.result(
+            started_at,
+            self.ok(
+                "debug_log_config",
+                json!({ "port_io_log_bytes": params.port_io_log_bytes }),
+            ),
+        )
     }
 
     #[tool(description = "Clear tx/rx buffers")]
@@ -795,6 +869,7 @@ mod tests {
             "port_clear",
             "port_subscribe_stream",
             "port_unsubscribe_stream",
+            "debug_log_config",
         ] {
             assert!(tool_names.contains(expected), "missing tool {expected}");
         }
@@ -1004,6 +1079,42 @@ mod tests {
         assert_eq!(event["sensitive"], false);
     }
 
+    #[test]
+    fn m8_tool_log_event_respects_port_io_display_scope() {
+        let response = crate::model::ToolResponse::success(
+            "port_send",
+            crate::model::RequestId::from_parts("20260526", 123),
+            crate::model::Timestamp::now_utc(),
+            serde_json::json!({ "sent_bytes": 5 }),
+        );
+        let hidden = crate::mcp::response::tool_log_event_with_port_io_for_tests(
+            &response,
+            crate::mcp::response::PortIoLogConfig { max_bytes: 0 },
+            Some(crate::mcp::response::PortIoLog::new(
+                crate::mcp::response::PortIoDirection::Tx,
+                b"hello".to_vec(),
+                crate::model::PayloadEncoding::Text,
+            )),
+        );
+        assert!(hidden.get("port_io").is_none());
+
+        let shown = crate::mcp::response::tool_log_event_with_port_io_for_tests(
+            &response,
+            crate::mcp::response::PortIoLogConfig { max_bytes: 3 },
+            Some(crate::mcp::response::PortIoLog::new(
+                crate::mcp::response::PortIoDirection::Tx,
+                b"hello".to_vec(),
+                crate::model::PayloadEncoding::Text,
+            )),
+        );
+        assert_eq!(shown["port_io"]["direction"], "tx");
+        assert_eq!(shown["port_io"]["bytes"], 5);
+        assert_eq!(shown["port_io"]["preview_encoding"], "text");
+        assert_eq!(shown["port_io"]["preview"], "hel");
+        assert_eq!(shown["port_io"]["hex"], "68656c");
+        assert_eq!(shown["port_io"]["omitted_bytes"], 2);
+    }
+
     #[tokio::test]
     async fn m9_port_scan_rejects_timeout_above_runtime_limit()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1094,6 +1205,50 @@ mod tests {
         .await?;
         assert_eq!(tcp["ok"], true);
         assert!(tcp["data"]["open_ports"].is_array());
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_debug_log_config_sets_port_io_display_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let configured = call_tool_json(
+            &client,
+            "debug_log_config",
+            object!({ "port_io_log_bytes": 64 }),
+        )
+        .await?;
+        assert_eq!(configured["ok"], true);
+        assert_eq!(configured["data"]["port_io_log_bytes"], 64);
+
+        let rejected = call_tool_json(
+            &client,
+            "debug_log_config",
+            object!({ "port_io_log_bytes": 65_537 }),
+        )
+        .await?;
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"]["code"], "INVALID_RANGE");
 
         client.cancel().await?;
         server_handle.await??;
