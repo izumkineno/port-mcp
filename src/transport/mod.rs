@@ -5,6 +5,7 @@ mod mock;
 mod serial;
 mod tcp;
 mod udp;
+mod visa;
 
 #[allow(unused_imports)]
 pub use common::{ScanResult, TransportError, port_scan_loopback};
@@ -16,6 +17,8 @@ pub use serial::{SerialPortSettings, SerialPortSummary, SerialWorker, scan_seria
 pub use tcp::{TcpClientTransport, TcpClientWorker, TcpListenTransport, TcpListenWorker};
 #[allow(unused_imports)]
 pub use udp::{UdpDatagram, UdpTransport, UdpWorker};
+#[allow(unused_imports)]
+pub use visa::{VisaResourceSummary, VisaScanResult, VisaWorker, scan_visa_resources};
 
 #[cfg(test)]
 pub(crate) fn serial_worker_for_tests(reads: Vec<Vec<u8>>) -> SerialWorker {

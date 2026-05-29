@@ -13,7 +13,8 @@ use serde_json::json;
 use crate::model::{
     ConfigSnapshot, DomainError, ErrorCategory, ErrorCode, ErrorDetails, HandleId, IdGenerator,
     InstanceState, InstanceStats, InstanceSummary, InstanceType, LastErrorSummary, ResourceSummary,
-    RuntimeLimits, SerialConfig, TcpConfig, Timestamp, UdpConfig, validate_instance_type,
+    RuntimeLimits, SerialConfig, TcpConfig, Timestamp, UdpConfig, VisaConfig,
+    validate_instance_type,
 };
 #[allow(unused_imports)]
 pub use buffers::{ClearResult, ClearTarget, PullResult};
@@ -168,6 +169,14 @@ impl RuntimeRegistry {
         config: UdpConfig,
     ) -> Result<InstanceSummary, DomainError> {
         self.configure(handle_id, InstanceType::Udp, ConfigSnapshot::Udp(config))
+    }
+
+    pub fn configure_visa(
+        &mut self,
+        handle_id: &HandleId,
+        config: VisaConfig,
+    ) -> Result<InstanceSummary, DomainError> {
+        self.configure(handle_id, InstanceType::Visa, ConfigSnapshot::Visa(config))
     }
 
     pub fn release_instance(
@@ -901,6 +910,7 @@ fn resource_summary(config: &ConfigSnapshot) -> ResourceSummary {
             config.remote_host.as_deref(),
             config.remote_port,
         ),
+        ConfigSnapshot::Visa(config) => ResourceSummary::visa(&config.resource_address, None),
     }
 }
 
@@ -917,6 +927,7 @@ fn mock_resource_key(instance: &RuntimeInstance) -> Result<Option<ResourceKey>, 
             &config.bind_host,
             config.bind_port,
         ))),
+        Some(ConfigSnapshot::Visa(config)) => Ok(Some(ResourceKey::visa(&config.resource_address))),
         None => Err(DomainError::new(
             ErrorCategory::InvalidState,
             ErrorCode::ConfigRequired,

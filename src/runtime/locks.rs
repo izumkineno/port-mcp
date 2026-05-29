@@ -18,6 +18,10 @@ impl ResourceKey {
         Self(format!("udp-bind:{}:{port}", normalize_host(host)))
     }
 
+    pub fn visa(resource_address: &str) -> Self {
+        Self(format!("visa:{}", resource_address.trim()))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -109,6 +113,8 @@ pub(crate) fn resource_lock_error(key: &ResourceKey, entry: &ResourceLockEntry) 
 fn resource_busy_code(key: &ResourceKey) -> ErrorCode {
     if key.as_str().starts_with("serial:") {
         ErrorCode::SerialPortBusy
+    } else if key.as_str().starts_with("visa:") {
+        ErrorCode::VisaResourceBusy
     } else if key.as_str().starts_with("tcp-listen:") {
         ErrorCode::TcpListenAddrBusy
     } else {
@@ -119,6 +125,8 @@ fn resource_busy_code(key: &ResourceKey) -> ErrorCode {
 fn resource_kind(key: &ResourceKey) -> &'static str {
     if key.as_str().starts_with("serial:") {
         "serial"
+    } else if key.as_str().starts_with("visa:") {
+        "visa"
     } else if key.as_str().starts_with("tcp-listen:") {
         "tcp-listen"
     } else {

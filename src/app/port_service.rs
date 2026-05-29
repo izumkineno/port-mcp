@@ -6,7 +6,8 @@ use crate::{
     runtime::{ClearResult, ClearTarget, PullResult, SendResult},
     transport::{
         ScanResult, SerialPortSummary, SerialWorker, TcpClientWorker, TcpListenWorker,
-        TransportError, UdpWorker, port_scan_loopback, scan_serial_ports,
+        TransportError, UdpWorker, VisaScanResult, VisaWorker, port_scan_loopback,
+        scan_serial_ports, scan_visa_resources,
     },
 };
 
@@ -19,12 +20,14 @@ impl InstanceService {
             InstanceType::Serial => self.connect_serial(handle_id, summary),
             InstanceType::Tcp => self.connect_tcp(handle_id, summary),
             InstanceType::Udp => self.connect_udp(handle_id, summary),
+            InstanceType::Visa => self.connect_visa(handle_id, summary),
         }
     }
 
     pub fn disconnect(&mut self, handle_id: &HandleId) -> Result<InstanceSummary, DomainError> {
         self.close_serial_worker(handle_id);
         self.close_network_worker(handle_id);
+        self.close_visa_worker(handle_id);
         self.registry.disconnect_mock(handle_id)
     }
 
@@ -65,6 +68,28 @@ impl InstanceService {
                         ErrorCategory::InvalidState,
                         ErrorCode::StateNotAllowed,
                         "Network worker does not match the configured instance.",
+                        "Reconnect the instance and retry.",
+                        false,
+                    ));
+                }
+            };
+            self.registry.record_direct_tx(handle_id, written)?;
+            return Ok(SendResult {
+                queued: false,
+                sent_bytes: written,
+            });
+        }
+
+        if let Some(worker) = self.visa_workers.get(handle_id.as_str()) {
+            self.registry.ensure_connected(handle_id, "port_send")?;
+            let summary = self.registry.query_instance(handle_id)?;
+            let written = match summary.config {
+                Some(ConfigSnapshot::Visa(_config)) => worker.write(&payload.bytes)?,
+                _ => {
+                    return Err(DomainError::new(
+                        ErrorCategory::InvalidState,
+                        ErrorCode::StateNotAllowed,
+                        "Visa worker does not match the configured instance.",
                         "Reconnect the instance and retry.",
                         false,
                     ));
@@ -133,6 +158,32 @@ impl InstanceService {
             });
         }
 
+        if let Some(worker) = self.visa_workers.get(handle_id.as_str()) {
+            self.registry.ensure_connected(handle_id, "port_pull")?;
+            let max_bytes = match max_bytes {
+                Some(value) => self.registry.validate_pull_max_bytes(value)?,
+                None => self.registry.default_pull_max_bytes(),
+            };
+            let bytes = match self.registry.query_instance(handle_id)?.config {
+                Some(ConfigSnapshot::Visa(_config)) => worker.read(max_bytes)?,
+                _ => {
+                    return Err(DomainError::new(
+                        ErrorCategory::InvalidState,
+                        ErrorCode::StateNotAllowed,
+                        "Visa worker does not match the configured instance.",
+                        "Reconnect the instance and retry.",
+                        false,
+                    ));
+                }
+            };
+            self.registry.record_direct_rx(handle_id, bytes.len())?;
+            return Ok(PullResult {
+                bytes,
+                truncated: false,
+                remaining_rx_buffer_bytes: 0,
+            });
+        }
+
         match self.registry.port_pull_mock(handle_id, max_bytes) {
             Ok(result) => Ok(result),
             Err(error) if error.code == ErrorCode::ReadTimeout => Ok(PullResult {
@@ -149,6 +200,12 @@ impl InstanceService {
         handle_id: &HandleId,
         target: ClearTarget,
     ) -> Result<ClearResult, DomainError> {
+        if let Some(worker) = self.visa_workers.get(handle_id.as_str()) {
+            self.registry.ensure_connected(handle_id, "port_clear")?;
+            let _ = target;
+            worker.clear()?;
+            return self.registry.port_clear_mock(handle_id, target);
+        }
         self.registry.port_clear_mock(handle_id, target)
     }
 }
@@ -231,6 +288,28 @@ impl InstanceService {
             .insert(handle_id.as_str().to_owned(), worker);
         self.registry.query_instance(handle_id)
     }
+
+    fn connect_visa(
+        &mut self,
+        handle_id: &HandleId,
+        summary: InstanceSummary,
+    ) -> Result<InstanceSummary, DomainError> {
+        let config = match summary.config {
+            Some(ConfigSnapshot::Visa(config)) => config,
+            _ => return self.registry.connect_mock(handle_id),
+        };
+        if self.visa_workers.contains_key(handle_id.as_str()) {
+            return self.registry.connect_mock(handle_id);
+        }
+        let worker = VisaWorker::open(&config)?;
+        if let Err(error) = self.registry.connect_mock(handle_id) {
+            let _ = worker.close();
+            return Err(error);
+        }
+        self.visa_workers
+            .insert(handle_id.as_str().to_owned(), worker);
+        self.registry.query_instance(handle_id)
+    }
 }
 
 fn serial_timeout_ms(
@@ -291,6 +370,32 @@ impl PortService {
                 "Check serial device permissions and driver state, then retry port_scan.",
                 false,
             )
+        })
+    }
+
+    pub fn scan_visa(
+        &self,
+        resource_filter: &str,
+        max_results: usize,
+    ) -> Result<VisaScanResult, DomainError> {
+        if max_results == 0 {
+            return Err(DomainError::invalid_argument(
+                ErrorCode::InvalidRange,
+                "visa scan max_results must be greater than zero.",
+                "Use a max_results value of at least 1.",
+            )
+            .with_detail("field", serde_json::json!("max_results"))
+            .with_detail("actual", serde_json::json!(max_results)));
+        }
+        scan_visa_resources(resource_filter, max_results).map_err(|error| {
+            DomainError::new(
+                error.category,
+                error.code,
+                error.message,
+                "Check the VISA runtime and resource filter, then retry port_scan.",
+                false,
+            )
+            .with_detail("backend", serde_json::json!("visa-rs"))
         })
     }
 

@@ -7,6 +7,8 @@ pub enum InstanceType {
     Tcp,
     #[serde(rename = "UDP")]
     Udp,
+    #[serde(rename = "Visa")]
+    Visa,
 }
 
 impl InstanceType {
@@ -15,6 +17,7 @@ impl InstanceType {
             Self::Serial => "ser",
             Self::Tcp => "tcp",
             Self::Udp => "udp",
+            Self::Visa => "visa",
         }
     }
 }

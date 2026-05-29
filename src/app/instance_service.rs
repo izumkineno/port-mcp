@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 
 use crate::{
-    model::{
-        ConfigSnapshot, DomainError, HandleId, InstanceSummary, InstanceType, TcpMode,
-    },
+    model::{ConfigSnapshot, DomainError, HandleId, InstanceSummary, InstanceType, TcpMode},
     runtime::{ResourceKey, RuntimeRegistry},
     transport::{
-        SerialWorker, TcpClientWorker, TcpListenWorker, TransportError, UdpWorker, resolve_udp_peer,
+        SerialWorker, TcpClientWorker, TcpListenWorker, TransportError, UdpWorker, VisaWorker,
+        resolve_udp_peer,
     },
 };
 
@@ -14,6 +13,7 @@ pub struct InstanceService {
     pub(crate) registry: RuntimeRegistry,
     pub(crate) serial_workers: HashMap<String, SerialWorker>,
     pub(crate) network_workers: HashMap<String, NetworkWorker>,
+    pub(crate) visa_workers: HashMap<String, VisaWorker>,
 }
 
 #[derive(Debug)]
@@ -112,6 +112,7 @@ fn resource_key_for_summary(summary: &InstanceSummary) -> Option<ResourceKey> {
             Some(ResourceKey::udp_bind(&config.bind_host, config.bind_port))
         }
         ConfigSnapshot::Serial(_) => None,
+        ConfigSnapshot::Visa(config) => Some(ResourceKey::visa(&config.resource_address)),
     }
 }
 
@@ -121,6 +122,7 @@ impl InstanceService {
             registry: RuntimeRegistry::new_for_tests(date),
             serial_workers: HashMap::new(),
             network_workers: HashMap::new(),
+            visa_workers: HashMap::new(),
         }
     }
 
@@ -159,6 +161,7 @@ impl InstanceService {
         let summary = self.registry.release_instance(handle_id, force)?;
         self.close_serial_worker(handle_id);
         self.close_network_worker(handle_id);
+        self.close_visa_worker(handle_id);
         if force {
             if let Some(resource_key) = resource_key_for_summary(&summary) {
                 let _ = self.registry.complete_mock_background_close(&resource_key);
@@ -176,6 +179,12 @@ impl InstanceService {
     pub(crate) fn close_network_worker(&mut self, handle_id: &HandleId) {
         if let Some(worker) = self.network_workers.remove(handle_id.as_str()) {
             worker.close();
+        }
+    }
+
+    pub(crate) fn close_visa_worker(&mut self, handle_id: &HandleId) {
+        if let Some(worker) = self.visa_workers.remove(handle_id.as_str()) {
+            let _ = worker.close();
         }
     }
 

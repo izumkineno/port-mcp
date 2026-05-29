@@ -17,7 +17,7 @@ use crate::{
     model::{
         DataBits, DomainError, ErrorCode, FlowControl, HandleId, IdGenerator, InstanceState,
         InstanceSummary, InstanceType, Parity, Payload, PayloadEncoding, RuntimeLimits,
-        SerialConfig, StopBits, TcpConfig, TcpMode, Timestamp, ToolResponse, UdpConfig,
+        SerialConfig, StopBits, TcpConfig, TcpMode, Timestamp, ToolResponse, UdpConfig, VisaConfig,
     },
     runtime::ClearTarget,
 };
@@ -111,7 +111,7 @@ impl PortMcpServer {
             "principles": [
                 "Always pass handle_id explicitly after instance_create; do not rely on session defaults unless you intentionally called instance_use.",
                 "Normal lifecycle is create -> configure -> connect -> send/pull or subscribe -> disconnect -> release.",
-                "Use port_scan before serial_config when the serial port name is unknown.",
+                "Use port_scan before serial_config or visa_config when the resource name is unknown.",
                 "Use debug_log_config only when troubleshooting raw I/O logs; port_io_log_bytes=0 disables raw I/O logging."
             ],
             "common_sequences": {
@@ -139,22 +139,32 @@ impl PortMcpServer {
                     { "tool": "instance_create", "arguments": { "type": "Serial" } },
                     { "tool": "serial_config", "arguments": { "handle_id": "<handle_id>", "port": "COM3", "baudrate": 115200, "data_bits": "Eight", "stop_bits": "One", "parity": "None", "flow_control": "None", "timeout_ms": 1000 } },
                     { "tool": "port_connect", "arguments": { "handle_id": "<handle_id>" } }
+                ],
+                "visa": [
+                    { "tool": "port_scan", "arguments": { "type": "Visa", "config": { "resource_filter": "?*INSTR", "max_results": 128 } } },
+                    { "tool": "instance_create", "arguments": { "type": "Visa" } },
+                    { "tool": "visa_config", "arguments": { "handle_id": "<handle_id>", "resource_address": "TCPIP0::192.168.1.10::INSTR", "open_timeout_ms": 1000, "io_timeout_ms": 1000, "encoding": "text" } },
+                    { "tool": "port_connect", "arguments": { "handle_id": "<handle_id>" } },
+                    { "tool": "port_send", "arguments": { "handle_id": "<handle_id>", "data": "*IDN?", "encoding": "text", "append_line_break": true } },
+                    { "tool": "port_pull", "arguments": { "handle_id": "<handle_id>", "max_bytes": 256 } },
+                    { "tool": "port_disconnect", "arguments": { "handle_id": "<handle_id>" } }
                 ]
             },
             "tool_notes": {
-                "instance_create": "Create a Serial, TCP, or UDP instance. Save data.summary.handle_id or handle_id from the response.",
+                "instance_create": "Create a Serial, TCP, UDP, or Visa instance. Save data.summary.handle_id or handle_id from the response.",
                 "instance_list": "List unreleased instances and their states; useful before choosing a handle_id.",
                 "instance_query": "Inspect one instance. Prefer passing handle_id explicitly.",
                 "instance_use": "Optional session convenience. Avoid for portable automation unless the client has stable session identity.",
                 "instance_release": "Release an instance after disconnect. If state is Connected, pass force=true only when cleanup is intended.",
                 "serial_config": "Configure only Serial instances. Required fields: handle_id and port. Common port examples: COM3, /dev/ttyUSB0.",
                 "tcp_udp_config": "Configure TCP or UDP instances. TCP client uses host/port; TCP listen uses mode=listen plus bind_host/bind_port; UDP uses bind_host/bind_port and optional remote_host/remote_port.",
-                "port_scan": "Serial scan accepts type=Serial and empty config. TCP/UDP scans require loopback host, start_port, and end_port in config.",
-                "port_connect": "Open the configured Serial/TCP/UDP resource. Requires state Configured or Disconnected.",
+                "visa_config": "Configure only Visa instances. Required field: handle_id and resource_address. Optional fields: open_timeout_ms, io_timeout_ms, read_termination, write_termination, encoding. query_idn_on_connect is reserved for later non-blocking identification and is not part of the basic flow.",
+                "port_scan": "Serial scan accepts type=Serial and empty config. Visa scan accepts type=Visa and optional resource_filter/max_results. TCP/UDP scans require loopback host, start_port, and end_port in config.",
+                "port_connect": "Open the configured Serial, TCP, UDP, or Visa resource. Requires state Configured or Disconnected.",
                 "port_disconnect": "Close a Connected instance while keeping its config for later reconnect.",
-                "port_send": "Send data on a Connected instance. encoding is text or hex; append_line_break defaults to false.",
-                "port_pull": "Read received bytes from a Connected instance. max_bytes is optional and bounded by runtime limits.",
-                "port_clear": "Clear tx, rx, or all buffers. target defaults to all.",
+                "port_send": "Send data on a Connected instance. encoding is text or hex; append_line_break defaults to false. Visa instances may append write_termination.",
+                "port_pull": "Read received bytes from a Connected instance. max_bytes is optional and bounded by runtime limits. Visa instances may honor read_termination.",
+                "port_clear": "Clear tx, rx, or all buffers. target defaults to all. Visa clear maps to the backend instrument clear call.",
                 "port_subscribe_stream": "Subscribe current MCP session to receive stream notifications for a Connected instance.",
                 "port_unsubscribe_stream": "Cancel a prior stream subscription for the current MCP session.",
                 "debug_log_config": "Set raw I/O preview bytes in logs. Use 0 to disable; maximum is 65536."
@@ -177,6 +187,8 @@ pub enum InstanceTypeParam {
     Tcp,
     #[serde(rename = "UDP", alias = "udp", alias = "Udp")]
     Udp,
+    #[serde(rename = "Visa", alias = "visa", alias = "VISA")]
+    Visa,
 }
 
 impl From<InstanceTypeParam> for InstanceType {
@@ -185,6 +197,7 @@ impl From<InstanceTypeParam> for InstanceType {
             InstanceTypeParam::Serial => Self::Serial,
             InstanceTypeParam::Tcp => Self::Tcp,
             InstanceTypeParam::Udp => Self::Udp,
+            InstanceTypeParam::Visa => Self::Visa,
         }
     }
 }
@@ -242,6 +255,22 @@ pub struct TcpUdpConfigParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VisaConfigParams {
+    handle_id: String,
+    resource_address: String,
+    #[serde(default = "default_timeout_ms")]
+    open_timeout_ms: u64,
+    #[serde(default = "default_timeout_ms")]
+    io_timeout_ms: u64,
+    read_termination: Option<String>,
+    write_termination: Option<String>,
+    #[serde(default)]
+    encoding: EncodingParam,
+    #[serde(default)]
+    query_idn_on_connect: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TcpModeParam {
     Client,
@@ -270,8 +299,12 @@ pub struct PortScanConfigParams {
     start_port: Option<u16>,
     #[serde(default)]
     end_port: Option<u16>,
+    #[serde(default)]
+    resource_filter: Option<String>,
     #[serde(default = "default_scan_concurrency")]
     max_concurrency: usize,
+    #[serde(default = "default_scan_results")]
+    max_results: usize,
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
 }
@@ -383,6 +416,10 @@ fn default_timeout_ms() -> u64 {
     1_000
 }
 
+fn default_scan_results() -> usize {
+    128
+}
+
 fn default_scan_concurrency() -> usize {
     16
 }
@@ -402,7 +439,7 @@ impl PortMcpServer {
     }
 
     #[tool(
-        description = "Create a Serial, TCP, or UDP instance without opening the resource. First step of every workflow; save the returned handle_id for all later calls."
+        description = "Create a Serial, TCP, UDP, or Visa instance without opening the resource. First step of every workflow; save the returned handle_id for all later calls."
     )]
     pub async fn instance_create(
         &self,
@@ -501,6 +538,28 @@ impl PortMcpServer {
     }
 
     #[tool(
+        description = "Configure a Visa instance before port_connect. Required: handle_id and resource_address. Optional: open_timeout_ms, io_timeout_ms, read_termination, write_termination, encoding, query_idn_on_connect."
+    )]
+    pub async fn visa_config(
+        &self,
+        Parameters(params): Parameters<VisaConfigParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let handle = HandleId::from(params.handle_id.as_str());
+        let config = VisaConfig {
+            resource_address: params.resource_address,
+            open_timeout_ms: params.open_timeout_ms,
+            io_timeout_ms: params.io_timeout_ms,
+            read_termination: params.read_termination,
+            write_termination: params.write_termination,
+            encoding: map_encoding(params.encoding),
+            query_idn_on_connect: params.query_idn_on_connect,
+        };
+        let summary = self.with_app(|app| app.configure_visa(&handle, config));
+        self.summary_response(started_at, "visa_config", summary)
+    }
+
+    #[tool(
         description = "Configure a TCP or UDP instance before port_connect. TCP client uses mode=client, host, port. TCP listen uses mode=listen, bind_host, bind_port. UDP uses bind_host, bind_port, and optional remote_host/remote_port."
     )]
     pub async fn tcp_udp_config(
@@ -550,6 +609,11 @@ impl PortMcpServer {
                     "tcp_udp_config cannot configure a Serial instance.",
                     "Use serial_config for Serial instances.",
                 )),
+                Ok(InstanceType::Visa) => Err(DomainError::invalid_argument(
+                    ErrorCode::TypeMismatch,
+                    "tcp_udp_config cannot configure a Visa instance.",
+                    "Use visa_config for Visa instances.",
+                )),
                 Err(error) => Err(error),
             }
         });
@@ -557,7 +621,7 @@ impl PortMcpServer {
     }
 
     #[tool(
-        description = "Scan available resources. For Serial, pass type=Serial and config={}. For TCP/UDP, pass loopback config with host, start_port, end_port, optional max_concurrency and timeout_ms."
+        description = "Scan available resources. For Serial, pass type=Serial and config={}. For Visa, pass type=Visa and optional resource_filter/max_results. For TCP/UDP, pass loopback config with host, start_port, end_port, optional max_concurrency and timeout_ms."
     )]
     pub async fn port_scan(
         &self,
@@ -569,6 +633,23 @@ impl PortMcpServer {
                 let service = PortService::new_for_tests("20260526");
                 let response = match service.scan_serial() {
                     Ok(resources) => self.ok("port_scan", json!({ "resources": resources })),
+                    Err(error) => self.err("port_scan", error),
+                };
+                self.result(started_at, response)
+            }
+            InstanceTypeParam::Visa => {
+                let service = PortService::new_for_tests("20260526");
+                let response = match service.scan_visa(
+                    params
+                        .config
+                        .resource_filter
+                        .as_deref()
+                        .unwrap_or("?*INSTR"),
+                    params.config.max_results,
+                ) {
+                    Ok(resources) => {
+                        self.ok("port_scan", json!({ "resources": resources.resources }))
+                    }
                     Err(error) => self.err("port_scan", error),
                 };
                 self.result(started_at, response)
@@ -672,7 +753,7 @@ impl PortMcpServer {
     }
 
     #[tool(
-        description = "Send payload on a Connected instance. Required: handle_id and data. encoding defaults to text; use encoding=hex for hexadecimal bytes. append_line_break defaults to false."
+        description = "Send payload on a Connected instance. Required: handle_id and data. encoding defaults to text; use encoding=hex for hexadecimal bytes. append_line_break defaults to false. Visa instances may append write_termination."
     )]
     pub async fn port_send(
         &self,
@@ -710,7 +791,7 @@ impl PortMcpServer {
     }
 
     #[tool(
-        description = "Pull received bytes from a Connected instance rx buffer. Required: handle_id. Optional max_bytes controls returned payload summary size within runtime limits."
+        description = "Pull received bytes from a Connected instance rx buffer. Required: handle_id. Optional max_bytes controls returned payload summary size within runtime limits. Visa instances may honor read_termination."
     )]
     pub async fn port_pull(
         &self,
@@ -787,7 +868,7 @@ impl PortMcpServer {
     }
 
     #[tool(
-        description = "Clear buffered data for an instance. Required: handle_id. target defaults to all; valid targets are tx, rx, and all."
+        description = "Clear buffered data for an instance. Required: handle_id. target defaults to all; valid targets are tx, rx, and all. Visa clear maps to the backend instrument clear call."
     )]
     pub async fn port_clear(
         &self,

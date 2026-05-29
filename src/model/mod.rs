@@ -12,8 +12,8 @@ mod state;
 #[allow(unused_imports)]
 pub use config::{
     ConfigSnapshot, DataBits, FlowControl, InstanceStats, InstanceSummary, Parity, PayloadEncoding,
-    ResourceSummary, SerialConfig, StopBits, TcpConfig, TcpMode, UdpConfig, validate_instance_type,
-    validate_required_field, validate_tcp_port,
+    ResourceSummary, SerialConfig, StopBits, TcpConfig, TcpMode, UdpConfig, VisaConfig,
+    validate_instance_type, validate_required_field, validate_tcp_port,
 };
 #[allow(unused_imports)]
 pub use data::{Payload, PayloadSummary};
@@ -41,6 +41,7 @@ mod tests {
         assert_eq!(json!(InstanceType::Serial), "Serial");
         assert_eq!(json!(InstanceType::Tcp), "TCP");
         assert_eq!(json!(InstanceType::Udp), "UDP");
+        assert_eq!(json!(InstanceType::Visa), "Visa");
 
         let states = vec![
             InstanceState::Created,
@@ -91,6 +92,18 @@ mod tests {
                 "display": "COM3"
             })
         );
+        assert_eq!(
+            serde_json::to_value(ResourceSummary::visa(
+                "TCPIP0::192.168.1.10::INSTR",
+                Some("tcpip")
+            ))
+            .unwrap(),
+            json!({
+                "kind": "visa",
+                "display": "TCPIP0::192.168.1.10::INSTR",
+                "resource_class": "tcpip"
+            })
+        );
     }
 
     #[test]
@@ -121,6 +134,10 @@ mod tests {
                 .unwrap_err()
                 .code,
             ErrorCode::TypeMismatch
+        );
+        assert_eq!(
+            HandleId::new_for_type(InstanceType::Visa, 1).as_str(),
+            "h_visa_001"
         );
         assert_eq!(
             TcpConfig::client("0.0.0.0", 9000).validate_remote().is_ok(),
@@ -200,12 +217,14 @@ mod tests {
                 ErrorCode::TextEncodingFailed,
             ),
             (ErrorCategory::ResourceBusy, ErrorCode::SerialPortBusy),
+            (ErrorCategory::ResourceBusy, ErrorCode::VisaResourceBusy),
             (ErrorCategory::ResourceBusy, ErrorCode::TcpListenAddrBusy),
             (ErrorCategory::ResourceBusy, ErrorCode::UdpBindAddrBusy),
             (ErrorCategory::ResourceBusy, ErrorCode::ResourceClosing),
             (ErrorCategory::ResourceBusy, ErrorCode::ResourceLockStale),
             (ErrorCategory::ConnectTimeout, ErrorCode::ConnectTimeout),
             (ErrorCategory::ConnectTimeout, ErrorCode::SerialOpenTimeout),
+            (ErrorCategory::ConnectTimeout, ErrorCode::VisaOpenTimeout),
             (ErrorCategory::ConnectTimeout, ErrorCode::ScanTimeout),
             (ErrorCategory::ReadTimeout, ErrorCode::ReadTimeout),
             (ErrorCategory::ReadTimeout, ErrorCode::NoDataAvailable),
@@ -239,6 +258,20 @@ mod tests {
             (
                 ErrorCategory::BufferLimitExceeded,
                 ErrorCode::ResultTooLarge,
+            ),
+            (ErrorCategory::InvalidState, ErrorCode::FeatureNotCompiled),
+            (
+                ErrorCategory::InvalidState,
+                ErrorCode::VisaRuntimeUnavailable,
+            ),
+            (ErrorCategory::WriteFailed, ErrorCode::VisaEnumFailed),
+            (ErrorCategory::WriteFailed, ErrorCode::VisaOpenFailed),
+            (ErrorCategory::WriteFailed, ErrorCode::VisaWriteFailed),
+            (ErrorCategory::WriteFailed, ErrorCode::VisaReadFailed),
+            (ErrorCategory::WriteFailed, ErrorCode::VisaQueryIdnFailed),
+            (
+                ErrorCategory::InvalidArgument,
+                ErrorCode::VisaResourceNotFound,
             ),
         ];
 

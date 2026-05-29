@@ -21,6 +21,8 @@ pub struct InstanceSummary {
 pub struct ResourceSummary {
     pub kind: String,
     pub display: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_class: Option<String>,
 }
 
 impl ResourceSummary {
@@ -28,6 +30,7 @@ impl ResourceSummary {
         Self {
             kind: "serial".to_owned(),
             display: port.to_owned(),
+            resource_class: None,
         }
     }
 
@@ -39,6 +42,7 @@ impl ResourceSummary {
         Self {
             kind: "tcp-client".to_owned(),
             display: format!("{host}:{port}"),
+            resource_class: None,
         }
     }
 
@@ -46,6 +50,7 @@ impl ResourceSummary {
         Self {
             kind: "tcp-listen".to_owned(),
             display: format!("{host}:{port}"),
+            resource_class: None,
         }
     }
 
@@ -64,6 +69,15 @@ impl ResourceSummary {
         Self {
             kind: "udp".to_owned(),
             display,
+            resource_class: None,
+        }
+    }
+
+    pub fn visa(resource_address: &str, resource_class: Option<&str>) -> Self {
+        Self {
+            kind: "visa".to_owned(),
+            display: resource_address.to_owned(),
+            resource_class: resource_class.map(str::to_owned),
         }
     }
 }
@@ -74,6 +88,7 @@ pub enum ConfigSnapshot {
     Serial(SerialConfig),
     Tcp(TcpConfig),
     Udp(UdpConfig),
+    Visa(VisaConfig),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +188,31 @@ pub struct UdpConfig {
     pub remote_host: Option<String>,
     pub remote_port: Option<u16>,
     pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisaConfig {
+    pub resource_address: String,
+    pub open_timeout_ms: u64,
+    pub io_timeout_ms: u64,
+    pub read_termination: Option<String>,
+    pub write_termination: Option<String>,
+    pub encoding: PayloadEncoding,
+    pub query_idn_on_connect: bool,
+}
+
+impl VisaConfig {
+    pub fn new(resource_address: &str) -> Self {
+        Self {
+            resource_address: resource_address.to_owned(),
+            open_timeout_ms: 1_000,
+            io_timeout_ms: 1_000,
+            read_termination: None,
+            write_termination: None,
+            encoding: PayloadEncoding::Text,
+            query_idn_on_connect: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -14,6 +14,11 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 bytes = "1"
 serialport = "4"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+visa-rs = { version = "0.7.0-alpha.1", optional = true }
+
+[features]
+default = []
+visa = ["dep:visa-rs"]
 
 [dev-dependencies]
 rmcp = { version = "1.7.0", features = ["client"] }

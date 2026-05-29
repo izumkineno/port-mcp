@@ -1,4 +1,6 @@
-use crate::model::{DomainError, HandleId, InstanceSummary, SerialConfig, TcpConfig, UdpConfig};
+use crate::model::{
+    DomainError, HandleId, InstanceSummary, SerialConfig, TcpConfig, UdpConfig, VisaConfig,
+};
 
 use super::InstanceService;
 
@@ -25,5 +27,13 @@ impl InstanceService {
         config: UdpConfig,
     ) -> Result<InstanceSummary, DomainError> {
         self.registry.configure_udp(handle_id, config)
+    }
+
+    pub fn configure_visa(
+        &mut self,
+        handle_id: &HandleId,
+        config: VisaConfig,
+    ) -> Result<InstanceSummary, DomainError> {
+        self.registry.configure_visa(handle_id, config)
     }
 }

@@ -98,6 +98,7 @@ pub struct IdGenerator {
     serial_counter: Cell<u64>,
     tcp_counter: Cell<u64>,
     udp_counter: Cell<u64>,
+    visa_counter: Cell<u64>,
 }
 
 impl IdGenerator {
@@ -109,6 +110,7 @@ impl IdGenerator {
             serial_counter: Cell::new(0),
             tcp_counter: Cell::new(0),
             udp_counter: Cell::new(0),
+            visa_counter: Cell::new(0),
         }
     }
 
@@ -127,6 +129,7 @@ impl IdGenerator {
             InstanceType::Serial => &self.serial_counter,
             InstanceType::Tcp => &self.tcp_counter,
             InstanceType::Udp => &self.udp_counter,
+            InstanceType::Visa => &self.visa_counter,
         };
         HandleId::new_for_type(instance_type, self.next(counter))
     }
