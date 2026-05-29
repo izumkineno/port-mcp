@@ -4,7 +4,7 @@
 ![MCP](https://img.shields.io/badge/MCP-stdio%20server-2F80ED)
 ![Status](https://img.shields.io/badge/status-initial%20scope%20implemented-2D9C5A)
 
-Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、UDP 调试场景，提供统一的实例管理、连接配置、收发、缓冲区读取和最小流式订阅能力。
+Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、UDP、VISA 仪器调试场景，提供统一的实例管理、连接配置、资源扫描、收发、缓冲区读取和最小流式订阅能力。
 
 这个仓库的目标不是做一个泛化设备平台，而是让 MCP 客户端能够以稳定、可审计、可验证的方式操作端口连接，并把调试过程沉淀为后续可复用的记录与文档。
 
@@ -12,8 +12,9 @@ Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、U
 
 当前 Rust `port-mcp` 已实现初版能力：
 
-- 创建 `Serial`、`TCP`、`UDP` 三类实例
-- 配置串口参数与 TCP/UDP 连接参数
+- 创建 `Serial`、`TCP`、`UDP`、`Visa` 四类实例
+- 配置串口参数、TCP/UDP 连接参数与 VISA resource address
+- 扫描串口、TCP/UDP loopback 端口与 VISA 资源
 - 连接、断开、释放实例
 - 发送 `text` 或 `hex` payload
 - 从接收缓冲区拉取数据摘要
@@ -21,7 +22,7 @@ Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、U
 - 订阅实例接收流的最小广播通知
 - 通过结构化错误返回、资源锁和状态机约束保证行为可诊断
 
-当前 stdio MCP server 暴露 15 个初版工具，详细列表见 [24-MCP工具列表与调用收发详解](docs/24-MCP工具列表与调用收发详解.md)。
+当前 stdio MCP server 暴露 16 个核心端口调试工具，并额外提供 `usage_guide` 与 `debug_log_config` 辅助工具。详细列表见 [24-MCP工具列表与调用收发详解](docs/24-MCP工具列表与调用收发详解.md)。
 
 ## 项目定位
 
@@ -30,14 +31,14 @@ Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、U
 当前仓库重点是：
 
 - Rust 原生 MCP server
-- Serial / TCP / UDP 的统一运行时
+- Serial / TCP / UDP / VISA 的统一运行时
 - 明确的状态机、资源生命周期和并发语义
 - 可自动化验证的无硬件路径
 - Windows 串口手工验收兜底
 
-当前仓库不包含这些已实现能力：
+当前仓库暂不包含这些进阶能力：
 
-- VISA / USBTMC / GPIB
+- VISA 之外的专用 USBTMC / GPIB 高级封装
 - Modbus / SCPI / AT / SLIP helper
 - 高级流式订阅触发条件
 - 自动重连、心跳、异常注入
@@ -52,6 +53,7 @@ Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、U
 - Rust stable toolchain
 - Windows 优先验证；Linux / macOS 可做补充验证
 - 若要做真实串口验证，需要本机可用串口设备、USB-TTL 回环或虚拟串口对
+- 若要做真实 VISA 验证，需要本机安装并配置可用的 VISA runtime / 驱动与可访问的仪器资源
 
 ### 2. 构建
 
@@ -78,6 +80,7 @@ cargo test
 - 单元测试
 - Mock transport
 - TCP/UDP loopback
+- VISA 类型、配置、资源锁与无硬件错误路径
 - 错误模型
 - MCP smoke
 
@@ -104,12 +107,18 @@ M8 验收记录见 [2026-05-26-M8-final-acceptance.md](docs/acceptance/2026-05-2
 
 ## 当前工具分组
 
-初版工具分为 4 组：
+核心端口调试工具分为 4 组：
 
 - 实例管理：`instance_create`、`instance_list`、`instance_query`、`instance_use`、`instance_release`
-- 连接配置：`serial_config`、`tcp_udp_config`
+- 连接配置：`serial_config`、`tcp_udp_config`、`visa_config`
 - 端口行为：`port_scan`、`port_connect`、`port_disconnect`、`port_send`、`port_pull`、`port_clear`
 - 最小流式订阅：`port_subscribe_stream`、`port_unsubscribe_stream`
+
+其中 `port_scan` 支持：
+
+- `type=Serial`：扫描本机串口
+- `type=Visa`：按 `resource_filter` 和 `max_results` 扫描 VISA 资源，例如 `?*INSTR`
+- `type=TCP` / `type=UDP`：按 loopback host 与端口范围扫描开放端口
 
 如果你需要：
 
