@@ -36,9 +36,11 @@
 
 ### 轻量协议 helper 契约
 
-`str_to_hex` 入参为 `input_string`，输出 `hex` 和 `input_bytes`。输入超过硬限制返回 `INVALID_RANGE`。
+`usage_guide` 无入参，返回面向 MCP agent 的机器可读 `common_sequences` 与 `tool_notes`。它用于在只看到工具元数据时快速选择调用顺序，不替代本文档中的详细契约。
 
-`hex_to_str` 入参为 `hex`，输出 `text` 和 `input_bytes`。非法 hex 返回 `INVALID_HEX`；hex 对应字节超过硬限制返回 `INVALID_RANGE`；无法按 UTF-8 解码返回 `TEXT_ENCODING_FAILED`。
+`str_to_hex` 入参为 `input_string`，输出 `hex` 和 `input_bytes`。当前实现固定按 UTF-8 处理，不接受 `encoding` 参数；输入超过 `HELPER_MAX_INPUT_BYTES`（当前 64 KiB）返回 `INVALID_RANGE`。
+
+`hex_to_str` 入参为 `hex`，输出 `text` 和 `input_bytes`。当前实现固定按 UTF-8 解码，不接受 `encoding` 参数；非法 hex 返回 `INVALID_HEX`；hex 对应字节超过 `HELPER_MAX_INPUT_BYTES`（当前 64 KiB）返回 `INVALID_RANGE`；无法按 UTF-8 解码返回 `TEXT_ENCODING_FAILED`。
 
 `modbus_helper` 当前仅支持 `mode=rtu`：
 
@@ -47,11 +49,11 @@
 - `crc_check` 默认 `true`。默认模式下坏 CRC 返回 `PROTOCOL_CHECKSUM_FAILED`；显式传 `crc_check=false` 时进入宽松诊断模式，坏 CRC 返回成功响应并置 `checksum_valid=false`。
 - 非法 hex 返回 `INVALID_HEX`；帧结构不合法返回 `PROTOCOL_FRAME_INVALID`。
 
-`scpi_helper` 当前支持 `action=normalize`，入参 `command`，可选 `arguments` 和 `expect_response`，返回归一化文本摘要。
+`scpi_helper` 当前支持 `action=normalize`，入参 `command`，可选 `arguments` 和 `expect_response`，返回 `kind=scpi`、`normalized` 和 `response_class` 摘要。
 
-`at_helper` 入参 `command`，返回 `basic`、`extended` 或 `custom` 分类。
+`at_helper` 入参 `command`，返回 `kind=at`、`normalized` 和 `response_class`；分类值为 `basic`、`extended` 或 `custom`。
 
-`slip_helper` 使用 `payload_hex`：`action=encode` 返回带 `C0` 边界的 SLIP frame hex；`action=decode` 要求输入是完整 framed SLIP hex。非法 escape，例如 closing delimiter 前的裸 `DB`，返回 `PROTOCOL_FRAME_INVALID`。
+`slip_helper` 使用 `payload_hex`：`action=encode` 返回带 `C0` 边界的 SLIP frame hex；`action=decode` 要求输入是完整 framed SLIP hex，并返回解码后的 payload hex。非法 escape，例如 closing delimiter 前的裸 `DB`，返回 `PROTOCOL_FRAME_INVALID`。
 
 ## MCP 调用外形
 
@@ -188,7 +190,7 @@ MCP 客户端调用工具时，传入的是工具名和 JSON object 参数。以
 }
 ```
 
-错误边界：`type` 非法时返回 `InvalidArgument`；不支持 VISA 或其他进阶类型。
+错误边界：`type` 非法时返回 `InvalidArgument`；当前支持 `Serial`、`TCP`、`UDP` 和 `Visa`。
 
 ### `instance_list`
 
@@ -697,11 +699,12 @@ instance_release(handle_id)
 
 | 目标 | 命令或检查 |
 | --- | --- |
-| 工具注册列表 | `cargo test m7_tool_list_registers_initial_contract_tools` |
+| 工具注册列表 | `cargo test m7_tool_list_registers_initial_contract_tools`；协议 helper 注册可用 `cargo test m9_tool_list_registers_protocol_helpers` |
 | MCP 端到端 smoke | `cargo test m7_e2e_smoke_covers_instance_config_port_and_release_tools` |
 | 会话订阅返回 | `cargo test m7_request_context_is_reflected_in_subscription_response` |
 | 日志字段 | `cargo test m8_tool_log_event_contains_correlation_state_duration_and_sensitivity_fields` |
 | `port_scan.timeout_ms` 上限 | `cargo test m9_port_scan_rejects_timeout_above_runtime_limit` |
+| 协议 helper 回归 | `cargo test m9_helper_` |
 | 全量回归 | `cargo test` |
 | SDK 边界 | 搜索 `rmcp|RequestContext|CallToolResult|ServerHandler|tool_router|tool_handler|schemars`，只应命中 `src/main.rs` 与 `src/mcp/*`。 |
 

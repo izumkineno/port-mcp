@@ -27,5 +27,8 @@ fn init_tracing() {
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
         .with_ansi(false)
+        .without_time()
+        .with_level(false)
+        .with_target(false)
         .try_init();
 }
