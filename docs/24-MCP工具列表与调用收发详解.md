@@ -457,11 +457,14 @@ UDP 示例：
 
 用途：向已连接实例发送 payload。
 
+TCP listen 多客户端模式下，`peer_id` 为可选字段：传入 `peer_id` 时只发送给指定 client；省略 `peer_id` 时广播给当前所有在线 client。该广播语义是进阶多客户端 listen 的明确契约。`peer_id` 只支持 TCP listen，传给 Serial、TCP client、UDP、Visa 或 Mock 实例会返回 `TYPE_MISMATCH`。
+
 Text 示例：
 
 ```json
 {
   "handle_id": "h_tcp_001",
+  "peer_id": "h_tcp_001:peer-1",
   "data": "ping",
   "encoding": "text",
   "append_line_break": false
@@ -495,17 +498,40 @@ Hex 示例：
 }
 ```
 
+TCP listen 定向发送成功时会额外返回 `target`：
+
+```json
+{
+  "data": {
+    "queued": false,
+    "sent_bytes": 4,
+    "target": {
+      "mode": "peer",
+      "peer_id": "h_tcp_001:peer-1",
+      "peer_count": 1,
+      "successful_peer_ids": ["h_tcp_001:peer-1"],
+      "failed_peer_count": 0
+    }
+  }
+}
+```
+
+TCP listen 广播成功时 `target.mode=broadcast`，`successful_peer_ids` 列出所有成功收到 payload 的 peer。广播至少一个 peer 成功即返回成功；失败 peer 会计入 `failed_peer_count`。
+
 错误边界：hex 非法返回 `INVALID_HEX`；未连接返回 `STATE_NOT_ALLOWED`；发送队列满返回 `TX_QUEUE_FULL`；单帧过大返回 `TX_FRAME_TOO_LARGE`；底层写失败返回 `WRITE_IO_FAILED` 或 `TRANSPORT_CLOSED`。
 
 ### `port_pull`
 
 用途：从接收缓冲区拉取最多 `max_bytes` 字节，并返回 payload 摘要。
 
+TCP listen 多客户端模式下，`peer_id` 为可选过滤字段：传入 `peer_id` 时只消费该 client 的入站数据；省略 `peer_id` 时返回下一段任意来源的入站数据。TCP listen 返回会包含 `source`，用于标识该 payload 来自哪个 client。
+
 入参：
 
 ```json
 {
   "handle_id": "h_tcp_001",
+  "peer_id": "h_tcp_001:peer-1",
   "max_bytes": 64
 }
 ```
@@ -526,6 +552,11 @@ Hex 示例：
       "omitted_bytes": 0,
       "truncated": false,
       "datagram": false
+    },
+    "source": {
+      "transport": "tcp-listen",
+      "peer_id": "h_tcp_001:peer-1",
+      "remote_addr": "127.0.0.1:54321"
     },
     "truncated": false,
     "remaining_rx_buffer_bytes": 0
