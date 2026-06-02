@@ -14,7 +14,9 @@ pub use mock::MockTransport;
 #[allow(unused_imports)]
 pub use serial::{SerialPortSettings, SerialPortSummary, SerialWorker, scan_serial_ports};
 #[allow(unused_imports)]
-pub use tcp::{TcpClientTransport, TcpClientWorker, TcpListenTransport, TcpListenWorker};
+pub use tcp::{
+    TcpClientTransport, TcpClientWorker, TcpListenTransport, TcpListenWorker, TcpListenWriteMode,
+};
 #[allow(unused_imports)]
 pub use udp::{UdpDatagram, UdpTransport, UdpWorker};
 #[allow(unused_imports)]
@@ -165,6 +167,62 @@ mod tests {
 
         server.close().unwrap();
         client.close().unwrap();
+    }
+
+    #[test]
+    fn integration_tcp_listen_worker_routes_multiple_clients() {
+        let probe = TcpListenTransport::bind("127.0.0.1", 0);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let listener = runtime.block_on(probe).unwrap();
+        let port = listener.local_addr().port();
+        runtime.block_on(listener.close()).unwrap();
+
+        let server = TcpListenWorker::bind("h_tcp_001", "127.0.0.1", port, 1_000).unwrap();
+        let client_a = TcpClientWorker::connect("127.0.0.1", port, 1_000).unwrap();
+        let client_b = TcpClientWorker::connect("127.0.0.1", port, 1_000).unwrap();
+
+        let peers = wait_for_tcp_peers(&server, 2);
+        assert_eq!(peers.len(), 2);
+        assert!(peers[0].peer_id.starts_with("h_tcp_001:peer-"));
+        let peer_a = peers[0].peer_id.clone();
+        let peer_b = peers[1].peer_id.clone();
+
+        let targeted = server.write(Some(&peer_a), b"one").unwrap();
+        assert_eq!(targeted.successful_peer_ids, vec![peer_a.clone()]);
+        assert_eq!(client_a.read(8).unwrap(), b"one".to_vec());
+
+        let broadcast = server.write(None, b"all").unwrap();
+        assert_eq!(broadcast.successful_peer_ids.len(), 2);
+        assert_eq!(client_a.read(8).unwrap(), b"all".to_vec());
+        assert_eq!(client_b.read(8).unwrap(), b"all".to_vec());
+
+        client_b.write(b"from-b").unwrap();
+        client_a.write(b"from-a").unwrap();
+        let from_b = server.read(Some(&peer_b), 16).unwrap();
+        assert_eq!(from_b.peer_id, peer_b);
+        assert_eq!(from_b.bytes, b"from-b".to_vec());
+        let from_a = server.read(Some(&peer_a), 16).unwrap();
+        assert_eq!(from_a.peer_id, peer_a);
+        assert_eq!(from_a.bytes, b"from-a".to_vec());
+
+        client_a.close().unwrap();
+        let remaining = wait_for_tcp_peers(&server, 1);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].peer_id, peer_b);
+
+        client_b.close().unwrap();
+        server.close().unwrap();
+    }
+
+    fn wait_for_tcp_peers(server: &TcpListenWorker, expected: usize) -> Vec<tcp::TcpPeerSummary> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let peers = server.list_peers().unwrap();
+            if peers.len() == expected || std::time::Instant::now() >= deadline {
+                return peers;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[tokio::test]

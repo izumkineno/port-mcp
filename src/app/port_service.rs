@@ -35,10 +35,12 @@ impl InstanceService {
         &mut self,
         handle_id: &HandleId,
         payload: &Payload,
+        peer_id: Option<&str>,
     ) -> Result<SendResult, DomainError> {
         self.registry.validate_tx_frame_len(payload.bytes.len())?;
 
         if let Some(worker) = self.serial_workers.get(handle_id.as_str()) {
+            reject_peer_id_for_transport(peer_id, "Serial")?;
             self.registry.ensure_connected(handle_id, "port_send")?;
             let written = worker
                 .write(
@@ -50,6 +52,7 @@ impl InstanceService {
             return Ok(SendResult {
                 queued: false,
                 sent_bytes: written,
+                target: None,
             });
         }
 
@@ -59,12 +62,20 @@ impl InstanceService {
             let written = match summary.config {
                 Some(ConfigSnapshot::Tcp(config)) => match config.mode {
                     TcpMode::Client | TcpMode::Listen => worker
-                        .tcp_write(&payload.bytes, &config)
+                        .tcp_write(&payload.bytes, &config, peer_id)
                         .map_err(transport_error_to_domain)?,
                 },
-                Some(ConfigSnapshot::Udp(config)) => worker
-                    .udp_send(&payload.bytes, &config)
-                    .map_err(transport_error_to_domain)?,
+                Some(ConfigSnapshot::Udp(config)) => {
+                    reject_peer_id_for_transport(peer_id, "UDP")?;
+                    let written = worker
+                        .udp_send(&payload.bytes, &config)
+                        .map_err(transport_error_to_domain)?;
+                    SendResult {
+                        queued: false,
+                        sent_bytes: written,
+                        target: None,
+                    }
+                }
                 _ => {
                     return Err(DomainError::new(
                         ErrorCategory::InvalidState,
@@ -75,14 +86,13 @@ impl InstanceService {
                     ));
                 }
             };
-            self.registry.record_direct_tx(handle_id, written)?;
-            return Ok(SendResult {
-                queued: false,
-                sent_bytes: written,
-            });
+            self.registry
+                .record_direct_tx(handle_id, written.sent_bytes)?;
+            return Ok(written);
         }
 
         if let Some(worker) = self.visa_workers.get(handle_id.as_str()) {
+            reject_peer_id_for_transport(peer_id, "Visa")?;
             self.registry.ensure_connected(handle_id, "port_send")?;
             let summary = self.registry.query_instance(handle_id)?;
             let written = match summary.config {
@@ -101,8 +111,11 @@ impl InstanceService {
             return Ok(SendResult {
                 queued: false,
                 sent_bytes: written,
+                target: None,
             });
         }
+
+        reject_peer_id_for_transport(peer_id, "Mock")?;
 
         self.registry.port_send_mock(handle_id, &payload.bytes)
     }
@@ -111,8 +124,10 @@ impl InstanceService {
         &mut self,
         handle_id: &HandleId,
         max_bytes: Option<usize>,
+        peer_id: Option<&str>,
     ) -> Result<PullResult, DomainError> {
         if let Some(worker) = self.serial_workers.get(handle_id.as_str()) {
+            reject_peer_id_for_transport(peer_id, "Serial")?;
             self.registry.ensure_connected(handle_id, "port_pull")?;
             let max_bytes = match max_bytes {
                 Some(value) => self.registry.validate_pull_max_bytes(value)?,
@@ -126,6 +141,7 @@ impl InstanceService {
                 bytes,
                 truncated: false,
                 remaining_rx_buffer_bytes: 0,
+                source: None,
             });
         }
 
@@ -137,11 +153,20 @@ impl InstanceService {
             };
             let bytes = match self.registry.query_instance(handle_id)?.config {
                 Some(ConfigSnapshot::Tcp(config)) => worker
-                    .tcp_read(max_bytes, &config)
+                    .tcp_read(max_bytes, &config, peer_id)
                     .map_err(transport_error_to_domain)?,
-                Some(ConfigSnapshot::Udp(config)) => worker
-                    .udp_recv(max_bytes, &config)
-                    .map_err(transport_error_to_domain)?,
+                Some(ConfigSnapshot::Udp(config)) => {
+                    reject_peer_id_for_transport(peer_id, "UDP")?;
+                    let bytes = worker
+                        .udp_recv(max_bytes, &config)
+                        .map_err(transport_error_to_domain)?;
+                    PullResult {
+                        bytes,
+                        truncated: false,
+                        remaining_rx_buffer_bytes: 0,
+                        source: None,
+                    }
+                }
                 _ => {
                     return Err(DomainError::new(
                         ErrorCategory::InvalidState,
@@ -152,15 +177,13 @@ impl InstanceService {
                     ));
                 }
             };
-            self.registry.record_direct_rx(handle_id, bytes.len())?;
-            return Ok(PullResult {
-                bytes,
-                truncated: false,
-                remaining_rx_buffer_bytes: 0,
-            });
+            self.registry
+                .record_direct_rx(handle_id, bytes.bytes.len())?;
+            return Ok(bytes);
         }
 
         if let Some(worker) = self.visa_workers.get(handle_id.as_str()) {
+            reject_peer_id_for_transport(peer_id, "Visa")?;
             self.registry.ensure_connected(handle_id, "port_pull")?;
             let max_bytes = match max_bytes {
                 Some(value) => self.registry.validate_pull_max_bytes(value)?,
@@ -183,8 +206,11 @@ impl InstanceService {
                 bytes,
                 truncated: false,
                 remaining_rx_buffer_bytes: 0,
+                source: None,
             });
         }
+
+        reject_peer_id_for_transport(peer_id, "Mock")?;
 
         match self.registry.port_pull_mock(handle_id, max_bytes) {
             Ok(result) => Ok(result),
@@ -192,6 +218,7 @@ impl InstanceService {
                 truncated: false,
                 remaining_rx_buffer_bytes: 0,
                 bytes: Vec::new(),
+                source: None,
             }),
             Err(error) => Err(error),
         }
@@ -210,6 +237,19 @@ impl InstanceService {
         }
         self.registry.port_clear_mock(handle_id, target)
     }
+}
+
+fn reject_peer_id_for_transport(peer_id: Option<&str>, transport: &str) -> Result<(), DomainError> {
+    if let Some(peer_id) = peer_id {
+        return Err(DomainError::invalid_argument(
+            ErrorCode::TypeMismatch,
+            format!("peer_id is not supported for {transport} instances."),
+            "Use peer_id only with TCP listen instances.",
+        )
+        .with_detail("peer_id", serde_json::json!(peer_id))
+        .with_detail("transport", serde_json::json!(transport)));
+    }
+    Ok(())
 }
 
 impl InstanceService {
@@ -253,8 +293,13 @@ impl InstanceService {
                     .map_err(transport_error_to_domain)?,
             ),
             TcpMode::Listen => NetworkWorker::TcpListen(
-                TcpListenWorker::bind(&config.host, config.port, config.timeout_ms)
-                    .map_err(transport_error_to_domain)?,
+                TcpListenWorker::bind(
+                    handle_id.as_str(),
+                    &config.host,
+                    config.port,
+                    config.timeout_ms,
+                )
+                .map_err(transport_error_to_domain)?,
             ),
         };
         if let Err(error) = self.registry.connect_mock(handle_id) {
@@ -458,12 +503,13 @@ mod tests {
             .send(
                 &created.handle_id,
                 &Payload::from_text("<01004580000>", false).unwrap(),
+                None,
             )
             .unwrap();
         assert_eq!(sent.sent_bytes, 13);
         assert!(!sent.queued);
 
-        let pulled = service.pull(&created.handle_id, Some(64)).unwrap();
+        let pulled = service.pull(&created.handle_id, Some(64), None).unwrap();
         assert_eq!(pulled.bytes, b"<01004580000>".to_vec());
         assert!(!pulled.truncated);
 
@@ -493,6 +539,7 @@ mod tests {
             .send(
                 &created.handle_id,
                 &Payload::from_text("12345", false).unwrap(),
+                None,
             )
             .unwrap_err();
 

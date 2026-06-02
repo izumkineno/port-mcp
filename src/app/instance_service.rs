@@ -2,13 +2,16 @@ use std::collections::HashMap;
 
 use crate::{
     model::{
-        ConfigSnapshot, DomainError, HandleId, InstanceSummary, InstanceType, RuntimeLimits,
-        TcpMode,
+        ConfigSnapshot, DomainError, HandleId, InstanceSummary, InstanceType, PeerSummary,
+        RuntimeLimits, TcpMode,
     },
-    runtime::{ResourceKey, RuntimeRegistry},
+    runtime::{
+        PullResult, PullSource, ResourceKey, RuntimeRegistry, SendResult, SendTargetMode,
+        SendTargetSummary,
+    },
     transport::{
-        SerialWorker, TcpClientWorker, TcpListenWorker, TransportError, UdpWorker, VisaWorker,
-        resolve_udp_peer,
+        SerialWorker, TcpClientWorker, TcpListenWorker, TcpListenWriteMode, TransportError,
+        UdpWorker, VisaWorker, resolve_udp_peer,
     },
 };
 
@@ -39,10 +42,40 @@ impl NetworkWorker {
         &self,
         bytes: &[u8],
         config: &crate::model::TcpConfig,
-    ) -> Result<usize, TransportError> {
+        peer_id: Option<&str>,
+    ) -> Result<SendResult, TransportError> {
         match (self, config.mode) {
-            (Self::TcpClient(worker), TcpMode::Client) => worker.write(bytes),
-            (Self::TcpListen(worker), TcpMode::Listen) => worker.write(bytes),
+            (Self::TcpClient(worker), TcpMode::Client) => {
+                if peer_id.is_some() {
+                    return Err(TransportError::transport_closed(
+                        "peer_id is only supported for tcp listen instances",
+                    ));
+                }
+                worker.write(bytes).map(|written| SendResult {
+                    queued: false,
+                    sent_bytes: written,
+                    target: None,
+                })
+            }
+            (Self::TcpListen(worker), TcpMode::Listen) => {
+                worker.write(peer_id, bytes).map(|result| {
+                    let mode = match result.mode {
+                        TcpListenWriteMode::Peer => SendTargetMode::Peer,
+                        TcpListenWriteMode::Broadcast => SendTargetMode::Broadcast,
+                    };
+                    SendResult {
+                        queued: false,
+                        sent_bytes: result.sent_bytes,
+                        target: Some(SendTargetSummary {
+                            mode,
+                            peer_id: result.peer_id,
+                            peer_count: result.successful_peer_ids.len(),
+                            successful_peer_ids: result.successful_peer_ids,
+                            failed_peer_count: result.failed_peer_count,
+                        }),
+                    }
+                })
+            }
             _ => Err(TransportError::transport_closed(
                 "tcp worker does not match the configured mode",
             )),
@@ -53,13 +86,52 @@ impl NetworkWorker {
         &self,
         max_bytes: usize,
         config: &crate::model::TcpConfig,
-    ) -> Result<Vec<u8>, TransportError> {
+        peer_id: Option<&str>,
+    ) -> Result<PullResult, TransportError> {
         match (self, config.mode) {
-            (Self::TcpClient(worker), TcpMode::Client) => worker.read(max_bytes),
-            (Self::TcpListen(worker), TcpMode::Listen) => worker.read(max_bytes),
+            (Self::TcpClient(worker), TcpMode::Client) => {
+                if peer_id.is_some() {
+                    return Err(TransportError::transport_closed(
+                        "peer_id is only supported for tcp listen instances",
+                    ));
+                }
+                worker.read(max_bytes).map(|bytes| PullResult {
+                    bytes,
+                    truncated: false,
+                    remaining_rx_buffer_bytes: 0,
+                    source: None,
+                })
+            }
+            (Self::TcpListen(worker), TcpMode::Listen) => {
+                worker.read(peer_id, max_bytes).map(|result| PullResult {
+                    bytes: result.bytes,
+                    truncated: false,
+                    remaining_rx_buffer_bytes: result.remaining_frames,
+                    source: Some(PullSource {
+                        transport: "tcp-listen".to_owned(),
+                        peer_id: result.peer_id,
+                        remote_addr: result.remote_addr,
+                    }),
+                })
+            }
             _ => Err(TransportError::transport_closed(
                 "tcp worker does not match the configured mode",
             )),
+        }
+    }
+
+    pub(crate) fn tcp_listen_peers(&self) -> Result<Vec<PeerSummary>, TransportError> {
+        match self {
+            Self::TcpListen(worker) => worker.list_peers().map(|peers| {
+                peers
+                    .into_iter()
+                    .map(|peer| PeerSummary {
+                        peer_id: peer.peer_id,
+                        remote_addr: peer.remote_addr,
+                    })
+                    .collect()
+            }),
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -138,7 +210,11 @@ impl InstanceService {
     }
 
     pub fn list(&self) -> Vec<InstanceSummary> {
-        self.registry.list_instances()
+        self.registry
+            .list_instances()
+            .into_iter()
+            .map(|summary| self.enrich_summary(summary))
+            .collect()
     }
 
     pub fn query(
@@ -147,7 +223,22 @@ impl InstanceService {
         session_id: Option<&str>,
     ) -> Result<InstanceSummary, DomainError> {
         let handle_id = self.registry.resolve_handle(handle_id, session_id)?;
-        self.registry.query_instance(&handle_id)
+        self.registry
+            .query_instance(&handle_id)
+            .map(|summary| self.enrich_summary(summary))
+    }
+
+    fn enrich_summary(&self, mut summary: InstanceSummary) -> InstanceSummary {
+        if !matches!(summary.config, Some(ConfigSnapshot::Tcp(ref config)) if config.mode == TcpMode::Listen)
+        {
+            return summary;
+        }
+        if let Some(worker) = self.network_workers.get(summary.handle_id.as_str()) {
+            if let Ok(peers) = worker.tcp_listen_peers() {
+                summary.peers = Some(peers);
+            }
+        }
+        summary
     }
 
     pub fn use_instance(

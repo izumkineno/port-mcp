@@ -138,7 +138,11 @@ impl PortMcpServer {
                 "tcp_listen": [
                     { "tool": "instance_create", "arguments": { "type": "TCP" } },
                     { "tool": "tcp_udp_config", "arguments": { "handle_id": "<handle_id>", "mode": "listen", "bind_host": "127.0.0.1", "bind_port": 9000, "timeout_ms": 1000 } },
-                    { "tool": "port_connect", "arguments": { "handle_id": "<handle_id>" } }
+                    { "tool": "port_connect", "arguments": { "handle_id": "<handle_id>" } },
+                    { "tool": "instance_query", "arguments": { "handle_id": "<handle_id>" } },
+                    { "tool": "port_send", "arguments": { "handle_id": "<handle_id>", "peer_id": "<peer_id>", "data": "ping", "encoding": "text" } },
+                    { "tool": "port_send", "arguments": { "handle_id": "<handle_id>", "data": "broadcast", "encoding": "text" } },
+                    { "tool": "port_pull", "arguments": { "handle_id": "<handle_id>", "peer_id": "<peer_id>", "max_bytes": 64 } }
                 ],
                 "udp": [
                     { "tool": "instance_create", "arguments": { "type": "UDP" } },
@@ -179,8 +183,8 @@ impl PortMcpServer {
                 "port_scan": "Serial scan accepts type=Serial and empty config. Visa scan accepts type=Visa and optional resource_filter/max_results. TCP/UDP scans require loopback host, start_port, and end_port in config.",
                 "port_connect": "Open the configured Serial, TCP, UDP, or Visa resource. Requires state Configured or Disconnected.",
                 "port_disconnect": "Close a Connected instance while keeping its config for later reconnect.",
-                "port_send": "Send data on a Connected instance. encoding is text or hex; append_line_break defaults to false. Visa instances may append write_termination.",
-                "port_pull": "Read received bytes from a Connected instance. max_bytes is optional and bounded by runtime limits. Visa instances may honor read_termination.",
+                "port_send": "Send data on a Connected instance. encoding is text or hex; append_line_break defaults to false. For TCP listen, pass peer_id to send to one client; omit peer_id to broadcast to all active clients. Visa instances may append write_termination.",
+                "port_pull": "Read received bytes from a Connected instance. max_bytes is optional and bounded by runtime limits. For TCP listen, pass peer_id to filter one client; responses include source metadata. Visa instances may honor read_termination.",
                 "port_clear": "Clear tx, rx, or all buffers. target defaults to all. Visa clear maps to the backend instrument clear call.",
                 "port_subscribe_stream": "Subscribe current MCP session to receive stream notifications for a Connected instance.",
                 "port_unsubscribe_stream": "Cancel a prior stream subscription for the current MCP session.",
@@ -336,6 +340,7 @@ pub struct PortScanConfigParams {
 pub struct PortSendParams {
     handle_id: String,
     data: String,
+    peer_id: Option<String>,
     #[serde(default)]
     encoding: EncodingParam,
     #[serde(default)]
@@ -346,6 +351,7 @@ pub struct PortSendParams {
 pub struct PortPullParams {
     handle_id: String,
     max_bytes: Option<usize>,
+    peer_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -890,6 +896,7 @@ impl PortMcpServer {
         let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let handle_for_app = handle.clone();
+        let peer_id = params.peer_id.clone();
         let payload = match params.encoding {
             EncodingParam::Text => Payload::from_text(&params.data, params.append_line_break),
             EncodingParam::Hex => Payload::from_hex(&params.data, params.append_line_break),
@@ -899,16 +906,32 @@ impl PortMcpServer {
                 let port_io =
                     PortIoLog::new(PortIoDirection::Tx, payload.bytes.clone(), payload.encoding);
                 let response = match self
-                    .with_app_blocking(move |app| app.send(&handle_for_app, &payload))
+                    .with_app_blocking(move |app| {
+                        app.send(&handle_for_app, &payload, peer_id.as_deref())
+                    })
                     .await
                 {
-                    Ok(result) => self
-                        .ok(
-                            "port_send",
-                            json!({ "queued": result.queued, "sent_bytes": result.sent_bytes }),
-                        )
-                        .with_handle(handle)
-                        .with_state(InstanceState::Connected),
+                    Ok(result) => {
+                        let mut data = json!({
+                            "queued": result.queued,
+                            "sent_bytes": result.sent_bytes
+                        });
+                        if let Some(target) = result.target {
+                            data["target"] = json!({
+                                "mode": match target.mode {
+                                    crate::runtime::SendTargetMode::Peer => "peer",
+                                    crate::runtime::SendTargetMode::Broadcast => "broadcast",
+                                },
+                                "peer_id": target.peer_id,
+                                "peer_count": target.peer_count,
+                                "successful_peer_ids": target.successful_peer_ids,
+                                "failed_peer_count": target.failed_peer_count,
+                            });
+                        }
+                        self.ok("port_send", data)
+                            .with_handle(handle)
+                            .with_state(InstanceState::Connected)
+                    }
                     Err(error) => self.err("port_send", error).with_handle(handle),
                 };
                 return self.result_with_port_io(started_at, response, Some(port_io));
@@ -928,8 +951,11 @@ impl PortMcpServer {
         let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
         let handle_for_app = handle.clone();
+        let peer_id = params.peer_id.clone();
         let response = match self
-            .with_app_blocking(move |app| app.pull(&handle_for_app, params.max_bytes))
+            .with_app_blocking(move |app| {
+                app.pull(&handle_for_app, params.max_bytes, peer_id.as_deref())
+            })
             .await
         {
             Ok(result) => {
@@ -938,16 +964,22 @@ impl PortMcpServer {
                     result.bytes.clone(),
                     PayloadEncoding::Text,
                 );
-                let response = self.ok(
-                    "port_pull",
-                    json!({
-                        "payload": PortService::summarize_payload(&result.bytes, PayloadEncoding::Text),
-                        "truncated": result.truncated,
-                        "remaining_rx_buffer_bytes": result.remaining_rx_buffer_bytes
-                    }),
-                )
-                .with_handle(handle)
-                .with_state(InstanceState::Connected);
+                let mut data = json!({
+                    "payload": PortService::summarize_payload(&result.bytes, PayloadEncoding::Text),
+                    "truncated": result.truncated,
+                    "remaining_rx_buffer_bytes": result.remaining_rx_buffer_bytes
+                });
+                if let Some(source) = result.source {
+                    data["source"] = json!({
+                        "transport": source.transport,
+                        "peer_id": source.peer_id,
+                        "remote_addr": source.remote_addr,
+                    });
+                }
+                let response = self
+                    .ok("port_pull", data)
+                    .with_handle(handle)
+                    .with_state(InstanceState::Connected);
                 return self.result_with_port_io(started_at, response, Some(port_io));
             }
             Err(error) => self.err("port_pull", error).with_handle(handle),
@@ -2142,6 +2174,212 @@ mod tests {
         server_handle.await??;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn n1_mcp_tcp_listen_supports_multiple_clients_and_peer_routing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(128 * 1024);
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let port_probe = TcpListener::bind("127.0.0.1:0").await?;
+        let listen_port = port_probe.local_addr()?.port();
+        drop(port_probe);
+
+        let server = call_tool_json(&client, "instance_create", object!({ "type": "TCP" })).await?;
+        let server_handle_id = server["handle_id"].as_str().unwrap();
+        call_tool_json(
+            &client,
+            "tcp_udp_config",
+            object!({
+                "handle_id": server_handle_id,
+                "mode": "listen",
+                "bind_host": "127.0.0.1",
+                "bind_port": listen_port,
+                "timeout_ms": 1000,
+            }),
+        )
+        .await?;
+        call_tool_json(
+            &client,
+            "port_connect",
+            object!({ "handle_id": server_handle_id }),
+        )
+        .await?;
+
+        let client_a = create_connected_tcp_client(&client, listen_port).await?;
+        let client_b = create_connected_tcp_client(&client, listen_port).await?;
+        let peers = wait_for_mcp_peers(&client, server_handle_id, 2).await?;
+        let peer_a = peers[0]["peer_id"].as_str().unwrap().to_owned();
+        let peer_b = peers[1]["peer_id"].as_str().unwrap().to_owned();
+        assert!(peer_a.starts_with("h_tcp_001:peer-"));
+        assert!(
+            peers[0]["remote_addr"]
+                .as_str()
+                .unwrap()
+                .starts_with("127.0.0.1:")
+        );
+
+        let targeted = call_tool_json(
+            &client,
+            "port_send",
+            object!({
+                "handle_id": server_handle_id,
+                "peer_id": peer_a,
+                "data": "one",
+                "encoding": "text"
+            }),
+        )
+        .await?;
+        assert_eq!(targeted["data"]["target"]["mode"], "peer");
+        assert_eq!(targeted["data"]["target"]["successful_peer_ids"][0], peer_a);
+        let received_a = call_tool_json(
+            &client,
+            "port_pull",
+            object!({ "handle_id": client_a, "max_bytes": 8 }),
+        )
+        .await?;
+        assert_eq!(received_a["data"]["payload"]["preview"], "one");
+
+        let broadcast = call_tool_json(
+            &client,
+            "port_send",
+            object!({
+                "handle_id": server_handle_id,
+                "data": "all",
+                "encoding": "text"
+            }),
+        )
+        .await?;
+        assert_eq!(broadcast["data"]["target"]["mode"], "broadcast");
+        assert_eq!(broadcast["data"]["target"]["peer_count"], 2);
+        assert_eq!(
+            call_tool_json(
+                &client,
+                "port_pull",
+                object!({ "handle_id": client_a, "max_bytes": 8 })
+            )
+            .await?["data"]["payload"]["preview"],
+            "all"
+        );
+        assert_eq!(
+            call_tool_json(
+                &client,
+                "port_pull",
+                object!({ "handle_id": client_b, "max_bytes": 8 })
+            )
+            .await?["data"]["payload"]["preview"],
+            "all"
+        );
+
+        call_tool_json(
+            &client,
+            "port_send",
+            object!({ "handle_id": client_b, "data": "from-b", "encoding": "text" }),
+        )
+        .await?;
+        let pulled_b = call_tool_json(
+            &client,
+            "port_pull",
+            object!({ "handle_id": server_handle_id, "peer_id": peer_b, "max_bytes": 16 }),
+        )
+        .await?;
+        assert_eq!(pulled_b["data"]["payload"]["preview"], "from-b");
+        assert_eq!(pulled_b["data"]["source"]["peer_id"], peer_b);
+
+        call_tool_json(
+            &client,
+            "port_disconnect",
+            object!({ "handle_id": client_a }),
+        )
+        .await?;
+        let remaining = wait_for_mcp_peers(&client, server_handle_id, 1).await?;
+        assert_eq!(remaining[0]["peer_id"], peer_b);
+
+        for handle_id in [client_b, server_handle_id.to_owned()] {
+            call_tool_json(
+                &client,
+                "port_disconnect",
+                object!({ "handle_id": handle_id }),
+            )
+            .await?;
+            call_tool_json(
+                &client,
+                "instance_release",
+                object!({ "handle_id": handle_id }),
+            )
+            .await?;
+        }
+        call_tool_json(
+            &client,
+            "instance_release",
+            object!({ "handle_id": client_a }),
+        )
+        .await?;
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    async fn create_connected_tcp_client(
+        client: &rmcp::service::RunningService<rmcp::RoleClient, SmokeClient>,
+        port: u16,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let created = call_tool_json(client, "instance_create", object!({ "type": "TCP" })).await?;
+        let handle_id = created["handle_id"].as_str().unwrap().to_owned();
+        call_tool_json(
+            client,
+            "tcp_udp_config",
+            object!({
+                "handle_id": handle_id,
+                "mode": "client",
+                "host": "127.0.0.1",
+                "port": port,
+                "timeout_ms": 1000,
+            }),
+        )
+        .await?;
+        call_tool_json(client, "port_connect", object!({ "handle_id": handle_id })).await?;
+        Ok(handle_id)
+    }
+
+    async fn wait_for_mcp_peers(
+        client: &rmcp::service::RunningService<rmcp::RoleClient, SmokeClient>,
+        handle_id: &str,
+        expected: usize,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let query = call_tool_json(
+                client,
+                "instance_query",
+                object!({ "handle_id": handle_id }),
+            )
+            .await?;
+            let peers = query["data"]["summary"]["peers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if peers.len() == expected || std::time::Instant::now() >= deadline {
+                return Ok(peers);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]

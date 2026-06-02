@@ -17,11 +17,11 @@ use crate::model::{
     validate_instance_type,
 };
 #[allow(unused_imports)]
-pub use buffers::{ClearResult, ClearTarget, PullResult};
+pub use buffers::{ClearResult, ClearTarget, PullResult, PullSource};
 #[allow(unused_imports)]
 pub use locks::{ResourceKey, ResourceLockState};
 #[allow(unused_imports)]
-pub use queues::{FlushResult, SendResult};
+pub use queues::{FlushResult, SendResult, SendTargetMode, SendTargetSummary};
 #[allow(unused_imports)]
 pub use subscriptions::{Notification, SubscriptionResult, UnsubscribeResult};
 #[allow(unused_imports)]
@@ -525,6 +525,7 @@ impl RuntimeRegistry {
         Ok(SendResult {
             queued: true,
             sent_bytes: bytes.len(),
+            target: None,
         })
     }
 
@@ -577,6 +578,7 @@ impl RuntimeRegistry {
             truncated: remaining > 0,
             remaining_rx_buffer_bytes: remaining,
             bytes,
+            source: None,
         })
     }
 
@@ -888,6 +890,7 @@ impl RuntimeInstance {
             resource: self.config.as_ref().map(resource_summary),
             config: self.config.clone(),
             stats: self.stats.clone(),
+            peers: None,
             last_error: self.last_error.clone(),
         }
     }

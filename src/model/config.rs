@@ -16,7 +16,15 @@ pub struct InstanceSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<ConfigSnapshot>,
     pub stats: InstanceStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peers: Option<Vec<PeerSummary>>,
     pub last_error: Option<LastErrorSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerSummary {
+    pub peer_id: String,
+    pub remote_addr: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

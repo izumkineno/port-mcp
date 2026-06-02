@@ -12,8 +12,8 @@ mod state;
 #[allow(unused_imports)]
 pub use config::{
     ConfigSnapshot, DataBits, FlowControl, InstanceStats, InstanceSummary, Parity, PayloadEncoding,
-    ResourceSummary, SerialConfig, StopBits, TcpConfig, TcpMode, UdpConfig, VisaConfig,
-    validate_instance_type, validate_required_field, validate_tcp_port,
+    PeerSummary, ResourceSummary, SerialConfig, StopBits, TcpConfig, TcpMode, UdpConfig,
+    VisaConfig, validate_instance_type, validate_required_field, validate_tcp_port,
 };
 #[allow(unused_imports)]
 pub use data::{Payload, PayloadSummary};
@@ -73,6 +73,7 @@ mod tests {
             resource: Some(ResourceSummary::tcp("127.0.0.1", 9000)),
             config: Some(ConfigSnapshot::Tcp(TcpConfig::client("127.0.0.1", 9000))),
             stats: InstanceStats::default(),
+            peers: None,
             last_error: None,
         };
 
