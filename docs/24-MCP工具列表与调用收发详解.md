@@ -6,7 +6,7 @@
 
 ## 当前工具总览
 
-当前 stdio MCP server 暴露 16 个初版工具，分为 5 组。
+当前 stdio MCP server 暴露初版端口工具、VISA 配置工具和轻量协议 helper。
 
 | 分组 | 工具 | 主要用途 | 实现入口 |
 | --- | --- | --- | --- |
@@ -26,6 +26,32 @@
 | 最小流式订阅 | `port_subscribe_stream` | 订阅当前会话的实例接收通知。 | `PortMcpServer::port_subscribe_stream` |
 | 最小流式订阅 | `port_unsubscribe_stream` | 取消当前会话的实例接收通知。 | `PortMcpServer::port_unsubscribe_stream` |
 | 调试配置 | `debug_log_config` | 设置调试日志中的端口原始收发数据显示范围。 | `PortMcpServer::debug_log_config` |
+| 协议 helper | `usage_guide` | 返回面向 MCP agent 的机器可读调用指南。 | `PortMcpServer::usage_guide` |
+| 协议 helper | `str_to_hex` | UTF-8 文本转 hex。 | `PortMcpServer::str_to_hex` |
+| 协议 helper | `hex_to_str` | hex 转 UTF-8 文本。 | `PortMcpServer::hex_to_str` |
+| 协议 helper | `modbus_helper` | Modbus RTU pack/unpack。 | `PortMcpServer::modbus_helper` |
+| 协议 helper | `scpi_helper` | SCPI 命令归一化摘要。 | `PortMcpServer::scpi_helper` |
+| 协议 helper | `at_helper` | AT 命令分类摘要。 | `PortMcpServer::at_helper` |
+| 协议 helper | `slip_helper` | SLIP payload encode/decode。 | `PortMcpServer::slip_helper` |
+
+### 轻量协议 helper 契约
+
+`str_to_hex` 入参为 `input_string`，输出 `hex` 和 `input_bytes`。输入超过硬限制返回 `INVALID_RANGE`。
+
+`hex_to_str` 入参为 `hex`，输出 `text` 和 `input_bytes`。非法 hex 返回 `INVALID_HEX`；hex 对应字节超过硬限制返回 `INVALID_RANGE`；无法按 UTF-8 解码返回 `TEXT_ENCODING_FAILED`。
+
+`modbus_helper` 当前仅支持 `mode=rtu`：
+
+- `action=pack` 需要 `slave_id`、`function_code`、`address`，并可选 `data_or_hex` 作为地址后的 payload hex。
+- `action=unpack` 必须传 `frame_hex` 作为完整 RTU 帧。`data_or_hex` 不作为 unpack 输入；只传 `data_or_hex` 会返回 `MISSING_REQUIRED_FIELD`，`details.field=frame_hex`。
+- `crc_check` 默认 `true`。默认模式下坏 CRC 返回 `PROTOCOL_CHECKSUM_FAILED`；显式传 `crc_check=false` 时进入宽松诊断模式，坏 CRC 返回成功响应并置 `checksum_valid=false`。
+- 非法 hex 返回 `INVALID_HEX`；帧结构不合法返回 `PROTOCOL_FRAME_INVALID`。
+
+`scpi_helper` 当前支持 `action=normalize`，入参 `command`，可选 `arguments` 和 `expect_response`，返回归一化文本摘要。
+
+`at_helper` 入参 `command`，返回 `basic`、`extended` 或 `custom` 分类。
+
+`slip_helper` 使用 `payload_hex`：`action=encode` 返回带 `C0` 边界的 SLIP frame hex；`action=decode` 要求输入是完整 framed SLIP hex。非法 escape，例如 closing delimiter 前的裸 `DB`，返回 `PROTOCOL_FRAME_INVALID`。
 
 ## MCP 调用外形
 
@@ -681,7 +707,7 @@ instance_release(handle_id)
 
 ## 已知边界
 
-- 初版不暴露 VISA、协议 helper、非 loopback scan allowlist、HTTP transport、OAuth 或高级订阅工具。
+- 当前实现已暴露 VISA 配置和轻量协议 helper；仍不暴露非 loopback scan allowlist、HTTP transport、OAuth 或高级订阅工具。
 - `mcp-server/` 是独立 TypeScript/OMG workflow server，不属于本文档描述的 Rust `port-mcp` 工具列表。
 - 默认自动化测试不依赖真实串口硬件；真实 COM 口验收属于 Windows 手工验收记录。
 - `port_scan` 只允许 loopback 单主机，并限制端口数量、并发和单项超时；不要把它当作通用网络扫描器。

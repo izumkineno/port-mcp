@@ -176,6 +176,155 @@ VisaConfig
 - `instance_list`、`instance_query` 中的 `data.summary.type` 允许出现 `Visa`。
 - 当 `visa` feature 未启用时，VISA 相关工具失败返回仍应沿用统一错误外形，不得退化成“工具不存在”。
 
+### 轻量协议 helper 最终契约
+
+这批 helper 已在代码中实现，属于 capability 2 的协议辅助工具，不是新的 VISA-only 工具族。它们仍然复用现有 `port_*` 抽象；VISA 本身继续只通过 `port_scan(type=Visa)`、`visa_config` 以及通用 `port_connect` / `port_send` / `port_pull` / `port_clear` 链路接入。
+
+#### `str_to_hex`
+
+用途：把 UTF-8 文本转换为十六进制字符串，供协议分帧、审计安全传输或二进制型 payload 使用。
+
+入参：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `input_string` | 是 | 待转换的文本。当前实现不提供单独编码选择器，默认按 UTF-8 处理。 |
+
+出参：
+
+| 字段 | 说明 |
+| --- | --- |
+| `hex` | 小写十六进制文本。 |
+| `input_bytes` | 输入文本占用的字节数。 |
+
+错误边界：
+
+- 输入超限：`INVALID_RANGE`
+
+#### `hex_to_str`
+
+用途：把十六进制字符串还原为 UTF-8 文本。
+
+入参：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `hex` | 是 | 十六进制字符串。 |
+
+出参：
+
+| 字段 | 说明 |
+| --- | --- |
+| `text` | 解码后的 UTF-8 文本。 |
+| `input_bytes` | 输入十六进制对应的字节数。 |
+
+错误边界：
+
+- 非法十六进制：`INVALID_HEX`
+- 输入超限：`INVALID_RANGE`
+- 字节序列无法解码为 UTF-8：`TEXT_ENCODING_FAILED`
+
+#### `modbus_helper`
+
+用途：提供 Modbus RTU 的帧打包/拆包基础能力。当前只覆盖 `rtu`；`ascii` 仅保留在枚举中，不作为可用实现路径。
+
+入参：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `action` | 是 | `pack` 或 `unpack`。 |
+| `mode` | 是 | 当前仅支持 `rtu`。 |
+| `slave_id` | pack 时是 | 从站地址。 |
+| `function_code` | pack 时是 | 功能码。 |
+| `address` | pack 时是 | 寄存器/线圈地址。 |
+| `data_or_hex` | pack 时否 | pack 时追加到地址后的可选 hex 数据；unpack 不接受该字段作为帧输入。 |
+| `frame_hex` | unpack 时是 | unpack 的完整 Modbus RTU 帧 hex 输入。 |
+| `crc_check` | 否 | 是否做严格 CRC 校验；默认 `true`，坏 CRC 返回 `PROTOCOL_CHECKSUM_FAILED`；显式传 `false` 时返回 `checksum_valid=false` 作为宽松诊断。 |
+
+出参：
+
+- `pack`：`action`、`mode`、`frame_hex`、`frame_bytes`、`crc_hex`
+- `unpack`：`action`、`mode`、`slave_id`、`function_code`、`address`、`data_hex`、`crc_hex`、`checksum_valid`
+
+错误边界：
+
+- 缺少必填字段：`MISSING_REQUIRED_FIELD`
+- 非法十六进制：`INVALID_HEX`
+- 帧结构不合法：`PROTOCOL_FRAME_INVALID`
+- CRC 不匹配：`PROTOCOL_CHECKSUM_FAILED`
+
+#### `scpi_helper`
+
+用途：对 SCPI 命令做归一化和摘要，不做完整协议解析。
+
+入参：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `action` | 是 | 当前仅支持 `normalize`。 |
+| `command` | 是 | SCPI 命令本体。 |
+| `arguments` | 否 | 命令参数文本。 |
+| `expect_response` | 否 | 对响应类型的预期提示。 |
+
+出参：
+
+| 字段 | 说明 |
+| --- | --- |
+| `kind` | 固定为 `scpi`。 |
+| `normalized` | 归一化后的文本。 |
+| `response_class` | 响应类别摘要。 |
+
+#### `at_helper`
+
+用途：对 AT 指令做基础分类和摘要，不做厂商专有语义扩展。
+
+入参：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `command` | 是 | AT 命令本体。 |
+
+出参：
+
+| 字段 | 说明 |
+| --- | --- |
+| `kind` | 固定为 `at`。 |
+| `normalized` | 归一化后的文本。 |
+| `response_class` | `basic` / `extended` / `custom`。 |
+
+分类规则：
+
+- `AT` → `basic`
+- `AT+...` → `extended`
+- 其他 → `custom`
+
+#### `slip_helper`
+
+用途：对 SLIP 帧做 encode/decode，输入和输出都以 hex payload 表示。
+
+入参：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `action` | 是 | `encode` 或 `decode`。 |
+| `payload_hex` | 是 | 十六进制 payload。 |
+
+出参：
+
+- `encode`：`kind`、`normalized`、`payload_hex`
+- `decode`：`kind`、`normalized`、`payload_hex`、`response_class`
+
+错误边界：
+
+- 非法十六进制：`INVALID_HEX`
+- SLIP 帧或转义结构不合法：`PROTOCOL_FRAME_INVALID`
+
+#### 与现有工具抽象的关系
+
+- 这些 helper 只补充协议侧的“最小公共能力”，不替代 `port_send` / `port_pull`。
+- `port_send` 继续负责实际写入，`port_pull` 继续负责实际读回；helper 只负责输入整形、摘要和帧处理。
+- VISA 不需要专属 helper 工具族；VISA 的新增面仍然是 `port_scan(type=Visa)` 与 `visa_config`，再加上通用 `port_*` 链路在 VISA 实例上的实现。
+
 ### `instance_create`
 
 用途：创建 Serial、TCP、UDP 或 Visa 实例，不打开底层资源。
