@@ -36,6 +36,8 @@ impl InstanceService {
         handle_id: &HandleId,
         payload: &Payload,
     ) -> Result<SendResult, DomainError> {
+        self.registry.validate_tx_frame_len(payload.bytes.len())?;
+
         if let Some(worker) = self.serial_workers.get(handle_id.as_str()) {
             self.registry.ensure_connected(handle_id, "port_send")?;
             let written = worker
@@ -301,6 +303,7 @@ impl InstanceService {
         if self.visa_workers.contains_key(handle_id.as_str()) {
             return self.registry.connect_mock(handle_id);
         }
+        self.registry.validate_visa_config(&config)?;
         let worker = VisaWorker::open(&config)?;
         if let Err(error) = self.registry.connect_mock(handle_id) {
             let _ = worker.close();
@@ -468,5 +471,32 @@ mod tests {
         assert_eq!(summary.stats.tx_bytes, 13);
         assert_eq!(summary.stats.rx_bytes, 13);
         assert_eq!(summary.stats.tx_queue_items, 0);
+    }
+
+    #[test]
+    fn unit_serial_send_rejects_oversized_frame_before_worker_write() {
+        let mut limits = RuntimeLimits::default();
+        limits.tx_frame_max_bytes = 4;
+        let mut service = InstanceService::new_for_tests_with_limits("20260526", limits);
+        let created = service.create(InstanceType::Serial).unwrap();
+        service
+            .registry
+            .configure_serial(&created.handle_id, SerialConfig::new("COM_TEST"))
+            .unwrap();
+        service.attach_serial_worker_for_tests(
+            &created.handle_id,
+            serial_worker_for_tests(vec![b"reply".to_vec()]),
+        );
+        service.connect(&created.handle_id).unwrap();
+
+        let error = service
+            .send(
+                &created.handle_id,
+                &Payload::from_text("12345", false).unwrap(),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.category, ErrorCategory::BufferLimitExceeded);
+        assert_eq!(error.code, ErrorCode::TxFrameTooLarge);
     }
 }

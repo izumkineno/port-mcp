@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use crate::{
-    model::{ConfigSnapshot, DomainError, HandleId, InstanceSummary, InstanceType, TcpMode},
+    model::{
+        ConfigSnapshot, DomainError, HandleId, InstanceSummary, InstanceType, RuntimeLimits,
+        TcpMode,
+    },
     runtime::{ResourceKey, RuntimeRegistry},
     transport::{
         SerialWorker, TcpClientWorker, TcpListenWorker, TransportError, UdpWorker, VisaWorker,
@@ -118,8 +121,12 @@ fn resource_key_for_summary(summary: &InstanceSummary) -> Option<ResourceKey> {
 
 impl InstanceService {
     pub fn new_for_tests(date: &str) -> Self {
+        Self::new_for_tests_with_limits(date, RuntimeLimits::default())
+    }
+
+    pub fn new_for_tests_with_limits(date: &str, limits: RuntimeLimits) -> Self {
         Self {
-            registry: RuntimeRegistry::new_for_tests(date),
+            registry: RuntimeRegistry::new_for_tests_with_limits(date, limits),
             serial_workers: HashMap::new(),
             network_workers: HashMap::new(),
             visa_workers: HashMap::new(),
@@ -210,13 +217,41 @@ impl InstanceService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{TcpConfig, UdpConfig};
+    use crate::model::{ErrorCode, RuntimeLimits, TcpConfig, UdpConfig};
 
     #[test]
-    fn unit_udp_remote_addr_accepts_non_loopback_host_strings() {
+    fn unit_udp_config_default_boundary_rejects_non_loopback_remote() {
+        let limits = RuntimeLimits::default();
+        let config = UdpConfig {
+            bind_host: "127.0.0.1".to_owned(),
+            bind_port: 9001,
+            remote_host: Some("192.0.2.1".to_owned()),
+            remote_port: Some(9002),
+            timeout_ms: 1_000,
+        };
+
+        assert_eq!(
+            config.validate_remote(&limits).unwrap_err().code,
+            ErrorCode::ScanTargetNotAllowed
+        );
+    }
+
+    #[test]
+    fn unit_udp_remote_addr_resolves_explicitly_allowlisted_non_loopback_host_strings() {
         let service = InstanceService::new_for_tests("20260526");
+        let mut limits = RuntimeLimits::default();
+        limits.network_allowed_hosts.push("192.0.2.1".to_owned());
+        let config = UdpConfig {
+            bind_host: "127.0.0.1".to_owned(),
+            bind_port: 9001,
+            remote_host: Some("192.0.2.1".to_owned()),
+            remote_port: Some(9002),
+            timeout_ms: 1_000,
+        };
+
+        config.validate_remote(&limits).unwrap();
         let result = service.udp_remote_addr_for_tests(&UdpConfig {
-            bind_host: "192.0.2.10".to_owned(),
+            bind_host: "127.0.0.1".to_owned(),
             bind_port: 9001,
             remote_host: Some("192.0.2.1".to_owned()),
             remote_port: Some(9002),
@@ -227,9 +262,28 @@ mod tests {
     }
 
     #[test]
-    fn unit_tcp_config_validation_no_longer_rejects_wildcard_hosts() {
-        assert!(TcpConfig::client("0.0.0.0", 9000).validate_remote().is_ok());
-        assert!(TcpConfig::client("::", 9000).validate_remote().is_ok());
-        assert!(TcpConfig::client("", 9000).validate_remote().is_ok());
+    fn unit_tcp_config_default_boundary_rejects_wildcard_hosts() {
+        let limits = RuntimeLimits::default();
+        assert_eq!(
+            TcpConfig::client("0.0.0.0", 9000)
+                .validate_remote(&limits)
+                .unwrap_err()
+                .code,
+            ErrorCode::ScanTargetNotAllowed
+        );
+        assert_eq!(
+            TcpConfig::client("::", 9000)
+                .validate_remote(&limits)
+                .unwrap_err()
+                .code,
+            ErrorCode::ScanTargetNotAllowed
+        );
+        assert_eq!(
+            TcpConfig::client("", 9000)
+                .validate_remote(&limits)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidAddress
+        );
     }
 }

@@ -20,6 +20,11 @@ use crate::{
         SerialConfig, StopBits, TcpConfig, TcpMode, Timestamp, ToolResponse, UdpConfig, VisaConfig,
     },
     runtime::ClearTarget,
+    util::{
+        ModbusMode, ModbusPackRequest, ModbusUnpackRequest, classify_at,
+        decode_slip_frame_with_limit, encode_slip_payload_with_limit, hex_to_str_with_limit,
+        normalize_scpi, pack_rtu_with_hex_limit, str_to_hex_with_limit, unpack_rtu_with_hex_limit,
+    },
 };
 
 #[derive(Clone)]
@@ -35,8 +40,14 @@ impl PortMcpServer {
     }
 
     pub fn new_for_tests(date: &str) -> Self {
+        Self::new_for_tests_with_limits(date, RuntimeLimits::default())
+    }
+
+    pub fn new_for_tests_with_limits(date: &str, limits: RuntimeLimits) -> Self {
         Self {
-            app: Arc::new(Mutex::new(InstanceService::new_for_tests(date))),
+            app: Arc::new(Mutex::new(InstanceService::new_for_tests_with_limits(
+                date, limits,
+            ))),
             ids: Arc::new(Mutex::new(IdGenerator::new_for_tests(date))),
             port_io_log_config: Arc::new(Mutex::new(PortIoLogConfig::default())),
         }
@@ -140,6 +151,12 @@ impl PortMcpServer {
                     { "tool": "serial_config", "arguments": { "handle_id": "<handle_id>", "port": "COM3", "baudrate": 115200, "data_bits": "Eight", "stop_bits": "One", "parity": "None", "flow_control": "None", "timeout_ms": 1000 } },
                     { "tool": "port_connect", "arguments": { "handle_id": "<handle_id>" } }
                 ],
+                "helpers": [
+                    { "tool": "str_to_hex", "arguments": { "input_string": "ping" } },
+                    { "tool": "hex_to_str", "arguments": { "hex": "70696e67" } },
+                    { "tool": "modbus_helper", "arguments": { "action": "pack", "mode": "rtu", "slave_id": 1, "function_code": 3, "address": 16, "data_or_hex": "0002" } },
+                    { "tool": "modbus_helper", "arguments": { "action": "unpack", "mode": "rtu", "frame_hex": "010300100002c5ce", "crc_check": true } }
+                ],
                 "visa": [
                     { "tool": "port_scan", "arguments": { "type": "Visa", "config": { "resource_filter": "?*INSTR", "max_results": 128 } } },
                     { "tool": "instance_create", "arguments": { "type": "Visa" } },
@@ -167,7 +184,13 @@ impl PortMcpServer {
                 "port_clear": "Clear tx, rx, or all buffers. target defaults to all. Visa clear maps to the backend instrument clear call.",
                 "port_subscribe_stream": "Subscribe current MCP session to receive stream notifications for a Connected instance.",
                 "port_unsubscribe_stream": "Cancel a prior stream subscription for the current MCP session.",
-                "debug_log_config": "Set raw I/O preview bytes in logs. Use 0 to disable; maximum is 65536."
+                "debug_log_config": "Set raw I/O preview bytes in logs. Use 0 to disable; maximum is 65536.",
+                "str_to_hex": "Convert text to hex for protocol framing and audit-safe transport input. encoding defaults to text/UTF-8 in the first slice.",
+                "hex_to_str": "Convert hex back to UTF-8 text when the payload is expected to be textual.",
+                "modbus_helper": "Pack or unpack Modbus RTU frames. pack accepts optional data_or_hex payload bytes; unpack requires frame_hex. crc_check defaults to true; pass false only for lenient diagnostics that report checksum_valid.",
+                "scpi_helper": "Normalize a SCPI command and its optional arguments into a concise audit-safe summary.",
+                "at_helper": "Classify a basic AT command into a normalized text summary and response class.",
+                "slip_helper": "Encode or decode SLIP payloads using framed hex payloads."
             }
         })
     }
@@ -343,6 +366,111 @@ pub struct SubscribeParams {
 pub struct DebugLogConfigParams {
     #[serde(default)]
     port_io_log_bytes: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StrToHexParams {
+    input_string: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HexToStrParams {
+    hex: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ModbusHelperParams {
+    action: ModbusActionParam,
+    #[serde(default)]
+    mode: ModbusModeParam,
+    #[serde(default)]
+    slave_id: Option<u8>,
+    #[serde(default)]
+    function_code: Option<u8>,
+    #[serde(default)]
+    address: Option<u16>,
+    #[serde(default)]
+    data_or_hex: Option<String>,
+    #[serde(default)]
+    frame_hex: Option<String>,
+    #[serde(default = "default_crc_check")]
+    crc_check: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ScpiHelperParams {
+    action: ScpiActionParam,
+    command: String,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    expect_response: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AtHelperParams {
+    command: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SlipHelperParams {
+    action: SlipActionParam,
+    payload_hex: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ScpiActionParam {
+    Normalize,
+}
+
+impl Default for ScpiActionParam {
+    fn default() -> Self {
+        Self::Normalize
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SlipActionParam {
+    Encode,
+    Decode,
+}
+
+impl Default for SlipActionParam {
+    fn default() -> Self {
+        Self::Encode
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ModbusActionParam {
+    Pack,
+    Unpack,
+}
+
+impl Default for ModbusActionParam {
+    fn default() -> Self {
+        Self::Pack
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ModbusModeParam {
+    Rtu,
+    Ascii,
+}
+
+impl Default for ModbusModeParam {
+    fn default() -> Self {
+        Self::Rtu
+    }
+}
+
+fn default_crc_check() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -868,6 +996,219 @@ impl PortMcpServer {
     }
 
     #[tool(
+        description = "Convert text to hex for protocol framing or audit-safe transport input. input_string is required. The first slice supports UTF-8 text only."
+    )]
+    pub async fn str_to_hex(
+        &self,
+        Parameters(params): Parameters<StrToHexParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let helper_limit = RuntimeLimits::HELPER_MAX_INPUT_BYTES;
+        let response =
+            match str_to_hex_with_limit(&params.input_string, "input_string", helper_limit) {
+                Ok(hex) => self.ok(
+                    "str_to_hex",
+                    json!({
+                        "hex": hex,
+                        "input_bytes": params.input_string.len(),
+                    }),
+                ),
+                Err(error) => self.err("str_to_hex", error),
+            };
+        self.result(started_at, response)
+    }
+
+    #[tool(
+        description = "Convert hex back to UTF-8 text when the payload is expected to be textual. hex is required."
+    )]
+    pub async fn hex_to_str(
+        &self,
+        Parameters(params): Parameters<HexToStrParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let helper_limit = RuntimeLimits::HELPER_MAX_INPUT_BYTES;
+        let response = match hex_to_str_with_limit(&params.hex, "hex", helper_limit) {
+            Ok(text) => self.ok(
+                "hex_to_str",
+                json!({
+                    "text": text,
+                    "input_bytes": params.hex.len() / 2,
+                }),
+            ),
+            Err(error) => self.err("hex_to_str", error),
+        };
+        self.result(started_at, response)
+    }
+
+    #[tool(
+        description = "Pack or unpack Modbus RTU frames. First slice supports action=pack or unpack and mode=rtu only. pack requires slave_id, function_code, address, and optional data_or_hex; unpack requires frame_hex."
+    )]
+    pub async fn modbus_helper(
+        &self,
+        Parameters(params): Parameters<ModbusHelperParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let response = match params.action {
+            ModbusActionParam::Pack => {
+                let slave_id = match required_modbus_u8("slave_id", params.slave_id) {
+                    Ok(value) => value,
+                    Err(error) => return self.result(started_at, self.err("modbus_helper", error)),
+                };
+                let function_code = match required_modbus_u8("function_code", params.function_code)
+                {
+                    Ok(value) => value,
+                    Err(error) => return self.result(started_at, self.err("modbus_helper", error)),
+                };
+                let address = match required_modbus_u16("address", params.address) {
+                    Ok(value) => value,
+                    Err(error) => return self.result(started_at, self.err("modbus_helper", error)),
+                };
+                let request = ModbusPackRequest {
+                    mode: map_modbus_mode(params.mode),
+                    slave_id,
+                    function_code,
+                    address,
+                    data_or_hex: params.data_or_hex,
+                    crc_check: params.crc_check,
+                };
+                match pack_rtu_with_hex_limit(request, RuntimeLimits::HELPER_MAX_INPUT_BYTES) {
+                    Ok(result) => self.ok(
+                        "modbus_helper",
+                        json!({
+                            "action": "pack",
+                            "mode": "rtu",
+                            "frame_hex": result.frame_hex,
+                            "frame_bytes": result.frame_bytes,
+                            "crc_hex": result.crc_hex,
+                        }),
+                    ),
+                    Err(error) => self.err("modbus_helper", error),
+                }
+            }
+            ModbusActionParam::Unpack => {
+                let frame_hex = match required_modbus_string("frame_hex", params.frame_hex) {
+                    Ok(value) => value,
+                    Err(error) => return self.result(started_at, self.err("modbus_helper", error)),
+                };
+                let request = ModbusUnpackRequest {
+                    mode: map_modbus_mode(params.mode),
+                    frame_hex,
+                    crc_check: params.crc_check,
+                };
+                match unpack_rtu_with_hex_limit(request, RuntimeLimits::HELPER_MAX_INPUT_BYTES) {
+                    Ok(result) => self.ok(
+                        "modbus_helper",
+                        json!({
+                            "action": "unpack",
+                            "mode": "rtu",
+                            "slave_id": result.slave_id,
+                            "function_code": result.function_code,
+                            "address": result.address,
+                            "data_hex": result.data_hex,
+                            "crc_hex": result.crc_hex,
+                            "checksum_valid": result.checksum_valid,
+                        }),
+                    ),
+                    Err(error) => self.err("modbus_helper", error),
+                }
+            }
+        };
+        self.result(started_at, response)
+    }
+
+    #[tool(
+        description = "Normalize a SCPI command and optional arguments into a compact summary. action currently supports normalize only."
+    )]
+    pub async fn scpi_helper(
+        &self,
+        Parameters(params): Parameters<ScpiHelperParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let response = match params.action {
+            ScpiActionParam::Normalize => match normalize_scpi(
+                &params.command,
+                params.arguments.as_deref(),
+                params.expect_response.as_deref(),
+            ) {
+                Ok(summary) => self.ok(
+                    "scpi_helper",
+                    json!({
+                        "kind": "scpi",
+                        "normalized": summary.normalized,
+                        "response_class": summary.response_class,
+                    }),
+                ),
+                Err(error) => self.err("scpi_helper", error),
+            },
+        };
+        self.result(started_at, response)
+    }
+
+    #[tool(
+        description = "Classify a basic AT command into a normalized text summary and response class."
+    )]
+    pub async fn at_helper(
+        &self,
+        Parameters(params): Parameters<AtHelperParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let response = match classify_at(&params.command) {
+            Ok(summary) => self.ok(
+                "at_helper",
+                json!({
+                    "kind": "at",
+                    "normalized": summary.normalized,
+                    "response_class": summary.response_class,
+                }),
+            ),
+            Err(error) => self.err("at_helper", error),
+        };
+        self.result(started_at, response)
+    }
+
+    #[tool(
+        description = "Encode or decode SLIP payloads using framed hex payloads. action supports encode and decode."
+    )]
+    pub async fn slip_helper(
+        &self,
+        Parameters(params): Parameters<SlipHelperParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let response = match params.action {
+            SlipActionParam::Encode => match encode_slip_payload_with_limit(
+                &params.payload_hex,
+                RuntimeLimits::HELPER_MAX_INPUT_BYTES,
+            ) {
+                Ok(summary) => self.ok(
+                    "slip_helper",
+                    json!({
+                        "kind": "slip",
+                        "normalized": summary.normalized,
+                        "payload_hex": summary.payload_hex,
+                    }),
+                ),
+                Err(error) => self.err("slip_helper", error),
+            },
+            SlipActionParam::Decode => match decode_slip_frame_with_limit(
+                &params.payload_hex,
+                RuntimeLimits::HELPER_MAX_INPUT_BYTES,
+            ) {
+                Ok(summary) => self.ok(
+                    "slip_helper",
+                    json!({
+                        "kind": "slip",
+                        "normalized": summary.normalized,
+                        "payload_hex": summary.payload_hex,
+                        "response_class": summary.response_class,
+                    }),
+                ),
+                Err(error) => self.err("slip_helper", error),
+            },
+        };
+        self.result(started_at, response)
+    }
+
+    #[tool(
         description = "Clear buffered data for an instance. Required: handle_id. target defaults to all; valid targets are tx, rx, and all. Visa clear maps to the backend instrument clear call."
     )]
     pub async fn port_clear(
@@ -1003,6 +1344,49 @@ fn map_tcp_mode(value: TcpModeParam) -> TcpMode {
     }
 }
 
+fn map_modbus_mode(value: ModbusModeParam) -> ModbusMode {
+    match value {
+        ModbusModeParam::Rtu => ModbusMode::Rtu,
+        ModbusModeParam::Ascii => ModbusMode::Ascii,
+    }
+}
+
+fn required_modbus_u8(field: &'static str, value: Option<u8>) -> Result<u8, DomainError> {
+    value.ok_or_else(|| {
+        DomainError::invalid_argument(
+            ErrorCode::MissingRequiredField,
+            format!("Missing required field `{field}`."),
+            format!("Provide `{field}` and retry."),
+        )
+        .with_detail("field", json!(field))
+    })
+}
+
+fn required_modbus_u16(field: &'static str, value: Option<u16>) -> Result<u16, DomainError> {
+    value.ok_or_else(|| {
+        DomainError::invalid_argument(
+            ErrorCode::MissingRequiredField,
+            format!("Missing required field `{field}`."),
+            format!("Provide `{field}` and retry."),
+        )
+        .with_detail("field", json!(field))
+    })
+}
+
+fn required_modbus_string(
+    field: &'static str,
+    value: Option<String>,
+) -> Result<String, DomainError> {
+    value.ok_or_else(|| {
+        DomainError::invalid_argument(
+            ErrorCode::MissingRequiredField,
+            format!("Missing required field `{field}`."),
+            format!("Provide `{field}` and retry."),
+        )
+        .with_detail("field", json!(field))
+    })
+}
+
 impl From<&str> for HandleId {
     fn from(value: &str) -> Self {
         Self::from_string(value)
@@ -1030,6 +1414,7 @@ mod tests {
     };
 
     use super::PortMcpServer;
+    use crate::model::RuntimeLimits;
 
     #[derive(Clone)]
     struct SmokeClient {
@@ -1067,6 +1452,12 @@ mod tests {
 
         for expected in [
             "usage_guide",
+            "str_to_hex",
+            "hex_to_str",
+            "modbus_helper",
+            "scpi_helper",
+            "at_helper",
+            "slip_helper",
             "instance_create",
             "instance_list",
             "instance_query",
@@ -1087,6 +1478,16 @@ mod tests {
             assert!(tool_names.contains(expected), "missing tool {expected}");
         }
         assert!(!tool_names.contains("m0_smoke"));
+
+        let modbus_tool = tools
+            .tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "modbus_helper")
+            .expect("modbus_helper tool is registered");
+        let description = modbus_tool.description.as_deref().unwrap_or_default();
+        assert!(description.contains("pack requires"));
+        assert!(description.contains("optional data_or_hex"));
+        assert!(description.contains("unpack requires frame_hex"));
 
         client.cancel().await?;
         server_handle.await??;
@@ -1133,6 +1534,18 @@ mod tests {
             response["data"]["common_sequences"]["serial"][0]["tool"],
             "port_scan"
         );
+        assert_eq!(
+            response["data"]["common_sequences"]["helpers"][0]["tool"],
+            "str_to_hex"
+        );
+        assert_eq!(
+            response["data"]["common_sequences"]["helpers"][2]["arguments"]["data_or_hex"],
+            "0002"
+        );
+        assert_eq!(
+            response["data"]["common_sequences"]["helpers"][3]["arguments"]["frame_hex"],
+            "010300100002c5ce"
+        );
         assert!(
             response["data"]["tool_notes"]["tcp_udp_config"]
                 .as_str()
@@ -1143,6 +1556,454 @@ mod tests {
         client.cancel().await?;
         server_handle.await??;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_helper_str_to_hex_returns_hex_string() -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let response =
+            call_tool_json(&client, "str_to_hex", object!({ "input_string": "ping" })).await?;
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["tool"], "str_to_hex");
+        assert_eq!(response["data"]["hex"], "70696e67");
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_helper_hex_to_str_returns_text() -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let response =
+            call_tool_json(&client, "hex_to_str", object!({ "hex": "70696e67" })).await?;
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["tool"], "hex_to_str");
+        assert_eq!(response["data"]["text"], "ping");
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_helper_hex_to_str_rejects_non_utf8() -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let response = call_tool_json(&client, "hex_to_str", object!({ "hex": "ff" })).await?;
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "TEXT_ENCODING_FAILED");
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_helper_str_to_hex_rejects_oversized_input() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let response = call_tool_json(
+            &client,
+            "str_to_hex",
+            object!({ "input_string": "x".repeat(crate::model::RuntimeLimits::HELPER_MAX_INPUT_BYTES + 1) }),
+        )
+        .await?;
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "INVALID_RANGE");
+        assert_eq!(response["error"]["details"]["field"], "input_string");
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_helper_modbus_pack_and_unpack_round_trip() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let pack = call_tool_json(
+            &client,
+            "modbus_helper",
+            object!({
+                "action": "pack",
+                "mode": "rtu",
+                "slave_id": 1,
+                "function_code": 3,
+                "address": 16,
+                "data_or_hex": "0002",
+                "crc_check": true
+            }),
+        )
+        .await?;
+        assert_eq!(pack["ok"], true);
+        let frame_hex = pack["data"]["frame_hex"].as_str().unwrap().to_owned();
+
+        let unpack = call_tool_json(
+            &client,
+            "modbus_helper",
+            object!({
+                "action": "unpack",
+                "mode": "rtu",
+                "frame_hex": frame_hex,
+                "crc_check": true
+            }),
+        )
+        .await?;
+        assert_eq!(unpack["ok"], true);
+        assert_eq!(unpack["data"]["slave_id"], 1);
+        assert_eq!(unpack["data"]["function_code"], 3);
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_helper_modbus_unpack_requires_frame_hex_without_old_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let response = call_tool_json(
+            &client,
+            "modbus_helper",
+            object!({
+                "action": "unpack",
+                "mode": "rtu",
+                "data_or_hex": "010300100002c5ce"
+            }),
+        )
+        .await?;
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "MISSING_REQUIRED_FIELD");
+        assert_eq!(response["error"]["details"]["field"], "frame_hex");
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_helper_modbus_crc_check_defaults_to_strict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let response = call_tool_json(
+            &client,
+            "modbus_helper",
+            object!({
+                "action": "unpack",
+                "mode": "rtu",
+                "frame_hex": "0103001000020000"
+            }),
+        )
+        .await?;
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "PROTOCOL_CHECKSUM_FAILED");
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_helper_scpi_normalize_returns_summary() -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let response = call_tool_json(
+            &client,
+            "scpi_helper",
+            object!({
+                "action": "normalize",
+                "command": "  *IDN?  ",
+                "arguments": " "
+            }),
+        )
+        .await?;
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["tool"], "scpi_helper");
+        assert_eq!(response["data"]["normalized"], "*IDN?");
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_helper_scpi_rejects_oversized_expect_response()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let response = call_tool_json(
+            &client,
+            "scpi_helper",
+            object!({
+                "action": "normalize",
+                "command": "*IDN?",
+                "expect_response": "x".repeat(513)
+            }),
+        )
+        .await?;
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "INVALID_RANGE");
+        assert_eq!(response["error"]["details"]["field"], "expect_response");
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_helper_at_classify_returns_summary() -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let response = call_tool_json(
+            &client,
+            "at_helper",
+            object!({
+                "command": "AT+CGMI"
+            }),
+        )
+        .await?;
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["tool"], "at_helper");
+        assert_eq!(response["data"]["normalized"], "AT+CGMI");
+        assert_eq!(response["data"]["response_class"], "extended");
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_helper_slip_encode_and_decode_round_trip() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let encoded = call_tool_json(
+            &client,
+            "slip_helper",
+            object!({
+                "action": "encode",
+                "payload_hex": "c0db01"
+            }),
+        )
+        .await?;
+        assert_eq!(encoded["ok"], true);
+        let slip_hex = encoded["data"]["normalized"].as_str().unwrap().to_owned();
+
+        let decoded = call_tool_json(
+            &client,
+            "slip_helper",
+            object!({
+                "action": "decode",
+                "payload_hex": slip_hex
+            }),
+        )
+        .await?;
+        assert_eq!(decoded["ok"], true);
+        assert_eq!(decoded["data"]["response_class"], "decoded");
+        assert_eq!(decoded["data"]["normalized"], "c0db01");
+        assert_eq!(decoded["data"]["payload_hex"], "c0db01");
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_helper_slip_reports_decode_and_limit_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let invalid_escape = call_tool_json(
+            &client,
+            "slip_helper",
+            object!({
+                "action": "decode",
+                "payload_hex": "c0db00c0"
+            }),
+        )
+        .await?;
+        assert_eq!(invalid_escape["ok"], false);
+        assert_eq!(invalid_escape["error"]["code"], "PROTOCOL_FRAME_INVALID");
+
+        let oversized = call_tool_json(
+            &client,
+            "slip_helper",
+            object!({
+                "action": "encode",
+                "payload_hex": "c0".repeat(crate::model::RuntimeLimits::HELPER_MAX_INPUT_BYTES)
+            }),
+        )
+        .await?;
+        assert_eq!(oversized["ok"], false);
+        assert_eq!(oversized["error"]["code"], "INVALID_RANGE");
+        assert_eq!(oversized["error"]["details"]["field"], "payload_hex");
+
+        client.cancel().await?;
+        server_handle.await??;
         Ok(())
     }
 
@@ -1381,6 +2242,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn r1_mcp_tcp_real_loopback_rejects_oversized_send_before_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listen_port = listener.local_addr()?.port();
+        let accept_task = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await?;
+            Ok::<(), std::io::Error>(())
+        });
+
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let mut limits = RuntimeLimits::default();
+        limits.tx_frame_max_bytes = 4;
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests_with_limits("20260526", limits)
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let created =
+            call_tool_json(&client, "instance_create", object!({ "type": "TCP" })).await?;
+        let handle_id = created["handle_id"].as_str().unwrap();
+        call_tool_json(
+            &client,
+            "tcp_udp_config",
+            object!({
+                "handle_id": handle_id,
+                "mode": "client",
+                "host": "127.0.0.1",
+                "port": listen_port,
+                "timeout_ms": 1000
+            }),
+        )
+        .await?;
+        call_tool_json(&client, "port_connect", object!({ "handle_id": handle_id })).await?;
+        accept_task.await??;
+
+        let rejected = call_tool_json(
+            &client,
+            "port_send",
+            object!({ "handle_id": handle_id, "data": "12345", "encoding": "text" }),
+        )
+        .await?;
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"]["code"], "TX_FRAME_TOO_LARGE");
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn r1_mcp_udp_send_reaches_real_loopback_listener()
     -> Result<(), Box<dyn std::error::Error>> {
         let listener = UdpSocket::bind("127.0.0.1:0").await?;
@@ -1441,6 +2364,71 @@ mod tests {
             .await
             .expect("real UDP listener should receive bytes from MCP port_send")??;
         assert_eq!(received, b"ping");
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn r1_mcp_udp_real_loopback_rejects_oversized_send_before_datagram()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = UdpSocket::bind("127.0.0.1:0").await?;
+        let listen_port = listener.local_addr()?.port();
+
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let mut limits = RuntimeLimits::default();
+        limits.tx_frame_max_bytes = 4;
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests_with_limits("20260526", limits)
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let created =
+            call_tool_json(&client, "instance_create", object!({ "type": "UDP" })).await?;
+        let handle_id = created["handle_id"].as_str().unwrap();
+        call_tool_json(
+            &client,
+            "tcp_udp_config",
+            object!({
+                "handle_id": handle_id,
+                "bind_host": "127.0.0.1",
+                "bind_port": 0,
+                "remote_host": "127.0.0.1",
+                "remote_port": listen_port,
+                "timeout_ms": 1000
+            }),
+        )
+        .await?;
+        call_tool_json(&client, "port_connect", object!({ "handle_id": handle_id })).await?;
+
+        let rejected = call_tool_json(
+            &client,
+            "port_send",
+            object!({ "handle_id": handle_id, "data": "12345", "encoding": "text" }),
+        )
+        .await?;
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"]["code"], "TX_FRAME_TOO_LARGE");
+
+        let mut buffer = [0_u8; 8];
+        assert!(
+            timeout(Duration::from_millis(100), listener.recv_from(&mut buffer))
+                .await
+                .is_err()
+        );
 
         client.cancel().await?;
         server_handle.await??;
@@ -1666,6 +2654,152 @@ mod tests {
         assert_eq!(response["error"]["code"], "INVALID_RANGE");
         assert_eq!(response["error"]["details"]["field"], "timeout_ms");
         assert_eq!(response["error"]["details"]["max"], 10_000);
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_instance_create_enforces_runtime_max_instances()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let mut limits = RuntimeLimits::default();
+        limits.max_instances = 1;
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests_with_limits("20260526", limits)
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let first =
+            call_tool_json(&client, "instance_create", object!({ "type": "Serial" })).await?;
+        assert_eq!(first["ok"], true);
+
+        let second = call_tool_json(&client, "instance_create", object!({ "type": "TCP" })).await?;
+        assert_eq!(second["ok"], false);
+        assert_eq!(second["error"]["category"], "BufferLimitExceeded");
+        assert_eq!(second["error"]["code"], "INVALID_RANGE");
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m9_config_rejects_runtime_timeout_and_network_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let mut limits = RuntimeLimits::default();
+        limits.io_timeout_max_ms = 2_000;
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests_with_limits("20260526", limits)
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let serial =
+            call_tool_json(&client, "instance_create", object!({ "type": "Serial" })).await?;
+        let serial_handle = serial["handle_id"].as_str().unwrap();
+        let serial_config = call_tool_json(
+            &client,
+            "serial_config",
+            object!({ "handle_id": serial_handle, "port": "COM3", "timeout_ms": 2_001 }),
+        )
+        .await?;
+        assert_eq!(serial_config["ok"], false);
+        assert_eq!(serial_config["error"]["code"], "INVALID_RANGE");
+        assert_eq!(serial_config["error"]["details"]["field"], "timeout_ms");
+
+        let tcp = call_tool_json(&client, "instance_create", object!({ "type": "TCP" })).await?;
+        let tcp_handle = tcp["handle_id"].as_str().unwrap();
+        let tcp_config = call_tool_json(
+            &client,
+            "tcp_udp_config",
+            object!({ "handle_id": tcp_handle, "mode": "client", "host": "192.0.2.1", "port": 9000 }),
+        )
+        .await?;
+        assert_eq!(tcp_config["ok"], false);
+        assert_eq!(tcp_config["error"]["code"], "SCAN_TARGET_NOT_ALLOWED");
+
+        let udp = call_tool_json(&client, "instance_create", object!({ "type": "UDP" })).await?;
+        let udp_handle = udp["handle_id"].as_str().unwrap();
+        let udp_config = call_tool_json(
+            &client,
+            "tcp_udp_config",
+            object!({
+                "handle_id": udp_handle,
+                "bind_host": "127.0.0.1",
+                "bind_port": 0,
+                "timeout_ms": 2_001
+            }),
+        )
+        .await?;
+        assert_eq!(udp_config["ok"], false);
+        assert_eq!(udp_config["error"]["code"], "INVALID_RANGE");
+
+        let visa = call_tool_json(&client, "instance_create", object!({ "type": "Visa" })).await?;
+        let visa_handle = visa["handle_id"].as_str().unwrap();
+        let visa_config = call_tool_json(
+            &client,
+            "visa_config",
+            object!({
+                "handle_id": visa_handle,
+                "resource_address": "TCPIP0::127.0.0.1::INSTR",
+                "open_timeout_ms": 2_001,
+                "io_timeout_ms": 1000
+            }),
+        )
+        .await?;
+        assert_eq!(visa_config["ok"], false);
+        assert_eq!(visa_config["error"]["code"], "INVALID_RANGE");
+        assert_eq!(visa_config["error"]["details"]["field"], "open_timeout_ms");
+
+        let visa_boundary =
+            call_tool_json(&client, "instance_create", object!({ "type": "Visa" })).await?;
+        let visa_boundary_handle = visa_boundary["handle_id"].as_str().unwrap();
+        let visa_boundary_config = call_tool_json(
+            &client,
+            "visa_config",
+            object!({
+                "handle_id": visa_boundary_handle,
+                "resource_address": "TCPIP0::192.0.2.1::INSTR",
+                "open_timeout_ms": 1000,
+                "io_timeout_ms": 1000
+            }),
+        )
+        .await?;
+        assert_eq!(visa_boundary_config["ok"], false);
+        assert_eq!(
+            visa_boundary_config["error"]["code"],
+            "SCAN_TARGET_NOT_ALLOWED"
+        );
+        assert_eq!(
+            visa_boundary_config["error"]["details"]["field"],
+            "resource_address.host"
+        );
 
         client.cancel().await?;
         server_handle.await??;
