@@ -50,6 +50,8 @@ pub enum ErrorCode {
     ScanTargetNotAllowed,
     InvalidHex,
     TextEncodingFailed,
+    ProtocolFrameInvalid,
+    ProtocolChecksumFailed,
     SerialPortBusy,
     VisaResourceBusy,
     TcpListenAddrBusy,
@@ -145,6 +147,32 @@ impl DomainError {
             "No data was available before the read timeout elapsed.",
             "Retry, increase timeout_ms, or subscribe to receive notifications.",
             true,
+        )
+    }
+
+    pub fn protocol_frame_invalid(
+        message: impl Into<String>,
+        recovery_hint: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            ErrorCategory::InvalidArgument,
+            ErrorCode::ProtocolFrameInvalid,
+            message,
+            recovery_hint,
+            false,
+        )
+    }
+
+    pub fn protocol_checksum_failed(
+        message: impl Into<String>,
+        recovery_hint: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            ErrorCategory::InvalidArgument,
+            ErrorCode::ProtocolChecksumFailed,
+            message,
+            recovery_hint,
+            false,
         )
     }
 

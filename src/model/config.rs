@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{DomainError, ErrorCode, HandleId, InstanceState, InstanceType, LastErrorSummary};
+use super::{
+    DomainError, ErrorCode, HandleId, InstanceState, InstanceType, LastErrorSummary, RuntimeLimits,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceSummary {
@@ -169,7 +171,13 @@ impl TcpConfig {
         }
     }
 
-    pub fn validate_remote(&self) -> Result<(), DomainError> {
+    pub fn validate_remote(&self, limits: &RuntimeLimits) -> Result<(), DomainError> {
+        let field = match self.mode {
+            TcpMode::Client => "host",
+            TcpMode::Listen => "bind_host",
+        };
+        limits.validate_network_host(field, &self.host)?;
+        limits.validate_io_timeout_ms("timeout_ms", self.timeout_ms)?;
         Ok(())
     }
 }
@@ -188,6 +196,17 @@ pub struct UdpConfig {
     pub remote_host: Option<String>,
     pub remote_port: Option<u16>,
     pub timeout_ms: u64,
+}
+
+impl UdpConfig {
+    pub fn validate_remote(&self, limits: &RuntimeLimits) -> Result<(), DomainError> {
+        limits.validate_network_host("bind_host", &self.bind_host)?;
+        if let Some(remote_host) = &self.remote_host {
+            limits.validate_network_host("remote_host", remote_host)?;
+        }
+        limits.validate_io_timeout_ms("timeout_ms", self.timeout_ms)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +232,45 @@ impl VisaConfig {
             query_idn_on_connect: false,
         }
     }
+
+    pub fn validate(&self, limits: &RuntimeLimits) -> Result<(), DomainError> {
+        limits.validate_io_timeout_ms("open_timeout_ms", self.open_timeout_ms)?;
+        limits.validate_io_timeout_ms("io_timeout_ms", self.io_timeout_ms)?;
+        if let Some(host) = visa_tcpip_host(&self.resource_address)? {
+            limits.validate_network_host("resource_address.host", host)?;
+        }
+        Ok(())
+    }
+}
+
+fn visa_tcpip_host(resource_address: &str) -> Result<Option<&str>, DomainError> {
+    let mut parts = resource_address.split("::");
+    let class = parts.next().unwrap_or_default().trim();
+    if !class.to_ascii_uppercase().starts_with("TCPIP") {
+        return Ok(None);
+    }
+
+    let host = parts.next().map(str::trim).ok_or_else(|| {
+        DomainError::invalid_argument(
+            ErrorCode::InvalidAddress,
+            "VISA TCPIP resource address is missing a host.",
+            "Use a valid TCPIP resource address such as TCPIP0::127.0.0.1::INSTR.",
+        )
+        .with_detail("field", serde_json::json!("resource_address.host"))
+        .with_detail("resource_address", serde_json::json!(resource_address))
+    })?;
+
+    if host.is_empty() {
+        return Err(DomainError::invalid_argument(
+            ErrorCode::InvalidAddress,
+            "VISA TCPIP resource address is missing a host.",
+            "Use a valid TCPIP resource address such as TCPIP0::127.0.0.1::INSTR.",
+        )
+        .with_detail("field", serde_json::json!("resource_address.host"))
+        .with_detail("resource_address", serde_json::json!(resource_address)));
+    }
+
+    Ok(Some(host))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

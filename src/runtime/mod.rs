@@ -68,6 +68,14 @@ impl RuntimeRegistry {
         &mut self,
         instance_type: InstanceType,
     ) -> Result<InstanceSummary, DomainError> {
+        if self.instances.len() >= self.limits.max_instances {
+            return Err(buffer_limit_error(
+                ErrorCode::InvalidRange,
+                "Instance limit exceeded.",
+                self.limits.max_instances,
+                self.instances.len() + 1,
+            ));
+        }
         let handle_id = self.ids.next_handle_id(instance_type);
         let instance = RuntimeInstance::new(handle_id.clone(), instance_type);
         let summary = instance.to_summary();
@@ -147,6 +155,8 @@ impl RuntimeRegistry {
         handle_id: &HandleId,
         config: SerialConfig,
     ) -> Result<InstanceSummary, DomainError> {
+        self.limits
+            .validate_io_timeout_ms("timeout_ms", config.timeout_ms)?;
         self.configure(
             handle_id,
             InstanceType::Serial,
@@ -159,7 +169,7 @@ impl RuntimeRegistry {
         handle_id: &HandleId,
         config: TcpConfig,
     ) -> Result<InstanceSummary, DomainError> {
-        config.validate_remote()?;
+        config.validate_remote(&self.limits)?;
         self.configure(handle_id, InstanceType::Tcp, ConfigSnapshot::Tcp(config))
     }
 
@@ -168,6 +178,7 @@ impl RuntimeRegistry {
         handle_id: &HandleId,
         config: UdpConfig,
     ) -> Result<InstanceSummary, DomainError> {
+        config.validate_remote(&self.limits)?;
         self.configure(handle_id, InstanceType::Udp, ConfigSnapshot::Udp(config))
     }
 
@@ -176,7 +187,12 @@ impl RuntimeRegistry {
         handle_id: &HandleId,
         config: VisaConfig,
     ) -> Result<InstanceSummary, DomainError> {
+        self.validate_visa_config(&config)?;
         self.configure(handle_id, InstanceType::Visa, ConfigSnapshot::Visa(config))
+    }
+
+    pub fn validate_visa_config(&self, config: &VisaConfig) -> Result<(), DomainError> {
+        config.validate(&self.limits)
     }
 
     pub fn release_instance(
@@ -747,6 +763,10 @@ impl RuntimeRegistry {
         self.limits.validate_pull_max_bytes(value)
     }
 
+    pub fn validate_tx_frame_len(&self, len: usize) -> Result<(), DomainError> {
+        self.limits.validate_tx_frame_len(len)
+    }
+
     pub fn default_pull_max_bytes(&self) -> usize {
         self.limits.pull_default_max_bytes
     }
@@ -1023,6 +1043,22 @@ mod tests {
     }
 
     #[test]
+    fn unit_registry_enforces_max_instances_and_releases_capacity() {
+        let mut limits = RuntimeLimits::default();
+        limits.max_instances = 1;
+        let mut registry = RuntimeRegistry::new_for_tests_with_limits("20260526", limits);
+
+        let serial = registry.create_instance(InstanceType::Serial).unwrap();
+        let error = registry.create_instance(InstanceType::Tcp).unwrap_err();
+        assert_eq!(error.category, ErrorCategory::BufferLimitExceeded);
+        assert_eq!(error.code, ErrorCode::InvalidRange);
+
+        registry.release_instance(&serial.handle_id, false).unwrap();
+        let tcp = registry.create_instance(InstanceType::Tcp).unwrap();
+        assert_eq!(tcp.handle_id.as_str(), "h_tcp_001");
+    }
+
+    #[test]
     fn unit_session_binding_resolves_default_handles_without_global_fallback() {
         let mut registry = RuntimeRegistry::new_for_tests("20260526");
         let instance = registry.create_instance(InstanceType::Udp).unwrap();
@@ -1097,6 +1133,79 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(udp_summary.config, Some(ConfigSnapshot::Udp(_))));
+    }
+
+    #[test]
+    fn unit_config_rejects_timeout_and_network_boundary_violations() {
+        let mut limits = RuntimeLimits::default();
+        limits.io_timeout_max_ms = 2_000;
+        let mut registry = RuntimeRegistry::new_for_tests_with_limits("20260526", limits);
+
+        let serial = registry.create_instance(InstanceType::Serial).unwrap();
+        let mut serial_config = SerialConfig::new("COM3");
+        serial_config.timeout_ms = 2_001;
+        assert_eq!(
+            registry
+                .configure_serial(&serial.handle_id, serial_config)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRange
+        );
+
+        let tcp = registry.create_instance(InstanceType::Tcp).unwrap();
+        assert_eq!(
+            registry
+                .configure_tcp(&tcp.handle_id, TcpConfig::client("192.0.2.1", 9000))
+                .unwrap_err()
+                .code,
+            ErrorCode::ScanTargetNotAllowed
+        );
+
+        let udp = registry.create_instance(InstanceType::Udp).unwrap();
+        assert_eq!(
+            registry
+                .configure_udp(
+                    &udp.handle_id,
+                    UdpConfig {
+                        bind_host: "0.0.0.0".to_owned(),
+                        bind_port: 9001,
+                        remote_host: None,
+                        remote_port: None,
+                        timeout_ms: 1_000,
+                    },
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::ScanTargetNotAllowed
+        );
+
+        let mut allow_limits = RuntimeLimits::default();
+        allow_limits
+            .network_allowed_hosts
+            .push("192.0.2.1".to_owned());
+        let mut allow_registry =
+            RuntimeRegistry::new_for_tests_with_limits("20260526", allow_limits);
+        let tcp = allow_registry.create_instance(InstanceType::Tcp).unwrap();
+        assert!(
+            allow_registry
+                .configure_tcp(&tcp.handle_id, TcpConfig::client("192.0.2.1", 9000))
+                .is_ok()
+        );
+        let visa = allow_registry.create_instance(InstanceType::Visa).unwrap();
+        assert!(
+            allow_registry
+                .configure_visa(&visa.handle_id, VisaConfig::new("TCPIP0::192.0.2.1::INSTR"))
+                .is_ok()
+        );
+
+        let visa = registry.create_instance(InstanceType::Visa).unwrap();
+        assert_eq!(
+            registry
+                .configure_visa(&visa.handle_id, VisaConfig::new("TCPIP0::192.0.2.1::INSTR"))
+                .unwrap_err()
+                .code,
+            ErrorCode::ScanTargetNotAllowed
+        );
     }
 
     #[test]

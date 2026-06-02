@@ -140,8 +140,11 @@ mod tests {
             "h_visa_001"
         );
         assert_eq!(
-            TcpConfig::client("0.0.0.0", 9000).validate_remote().is_ok(),
-            true
+            TcpConfig::client("0.0.0.0", 9000)
+                .validate_remote(&RuntimeLimits::default())
+                .unwrap_err()
+                .code,
+            ErrorCode::ScanTargetNotAllowed
         );
     }
 
@@ -215,6 +218,14 @@ mod tests {
             (
                 ErrorCategory::InvalidArgument,
                 ErrorCode::TextEncodingFailed,
+            ),
+            (
+                ErrorCategory::InvalidArgument,
+                ErrorCode::ProtocolFrameInvalid,
+            ),
+            (
+                ErrorCategory::InvalidArgument,
+                ErrorCode::ProtocolChecksumFailed,
             ),
             (ErrorCategory::ResourceBusy, ErrorCode::SerialPortBusy),
             (ErrorCategory::ResourceBusy, ErrorCode::VisaResourceBusy),
@@ -386,11 +397,14 @@ mod tests {
         assert_eq!(limits.scan_max_concurrency, 64);
         assert_eq!(limits.scan_max_ports, 256);
         assert_eq!(limits.scan_total_timeout_ms, 10_000);
+        assert_eq!(limits.io_timeout_max_ms, 30_000);
         assert_eq!(limits.max_instances, 64);
         assert_eq!(limits.max_subscribers_per_instance, 32);
         assert_eq!(limits.max_total_buffer_bytes, 128 * 1024 * 1024);
         assert_eq!(limits.max_total_queued_bytes, 64 * 1024 * 1024);
         assert_eq!(limits.force_close_deadline_ms, 5_000);
+        assert!(!limits.allow_non_loopback_network);
+        assert!(limits.network_allowed_hosts.is_empty());
 
         assert!(RuntimeLimits::ABS_MAX_TOTAL_BUFFER_BYTES >= limits.max_total_buffer_bytes);
         assert!(RuntimeLimits::ABS_MAX_TOTAL_QUEUED_BYTES >= limits.max_total_queued_bytes);
@@ -402,11 +416,65 @@ mod tests {
             limits.validate_pull_max_bytes(128 * 1024).unwrap_err().code,
             ErrorCode::PullMaxBytesExceeded
         );
+        assert_eq!(limits.validate_io_timeout_ms("timeout_ms", 1).unwrap(), 1);
+        assert_eq!(
+            limits
+                .validate_io_timeout_ms("timeout_ms", limits.io_timeout_max_ms + 1)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRange
+        );
+        assert!(
+            limits
+                .validate_tx_frame_len(limits.tx_frame_max_bytes)
+                .is_ok()
+        );
+        assert_eq!(
+            limits
+                .validate_tx_frame_len(limits.tx_frame_max_bytes + 1)
+                .unwrap_err()
+                .code,
+            ErrorCode::TxFrameTooLarge
+        );
+        assert!(limits.validate_network_host("host", "127.0.0.1").is_ok());
+        assert_eq!(
+            limits
+                .validate_network_host("host", "192.0.2.1")
+                .unwrap_err()
+                .code,
+            ErrorCode::ScanTargetNotAllowed
+        );
+
+        let mut allowlisted = RuntimeLimits::default();
+        allowlisted
+            .network_allowed_hosts
+            .push("192.0.2.1".to_owned());
+        assert!(
+            allowlisted
+                .validate_network_host("host", "192.0.2.1")
+                .is_ok()
+        );
+
+        assert_eq!(
+            VisaConfig::new("TCPIP0::192.0.2.1::INSTR")
+                .validate(&RuntimeLimits::default())
+                .unwrap_err()
+                .code,
+            ErrorCode::ScanTargetNotAllowed
+        );
+        assert!(
+            VisaConfig::new("TCPIP0::192.0.2.1::INSTR")
+                .validate(&allowlisted)
+                .is_ok()
+        );
+        assert!(VisaConfig::new("ASRL3::INSTR").validate(&limits).is_ok());
 
         let serialized: Value = serde_json::to_value(limits).unwrap();
         assert_eq!(
             serialized["scan_allowed_hosts"],
             json!(["127.0.0.0/8", "::1"])
         );
+        assert_eq!(serialized["io_timeout_max_ms"], json!(30_000));
+        assert_eq!(serialized["allow_non_loopback_network"], json!(false));
     }
 }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use super::{DomainError, ErrorCode, PayloadEncoding};
+use super::{DomainError, PayloadEncoding};
+use crate::util::encoding::{bytes_to_hex, hex_to_bytes, text_to_bytes};
 
 #[derive(Debug)]
 pub struct Payload {
@@ -10,7 +11,7 @@ pub struct Payload {
 
 impl Payload {
     pub fn from_text(input: &str, append_line_break: bool) -> Result<Self, DomainError> {
-        let mut bytes = input.as_bytes().to_vec();
+        let mut bytes = text_to_bytes(input)?;
         if append_line_break {
             bytes.push(b'\n');
         }
@@ -21,27 +22,7 @@ impl Payload {
     }
 
     pub fn from_hex(input: &str, append_line_break: bool) -> Result<Self, DomainError> {
-        if !input.len().is_multiple_of(2)
-            || !input.chars().all(|character| character.is_ascii_hexdigit())
-        {
-            return Err(DomainError::invalid_argument(
-                ErrorCode::InvalidHex,
-                "Hex payload must contain an even number of hexadecimal characters.",
-                "Use only 0-9, a-f, A-F and provide an even character count.",
-            ));
-        }
-
-        let mut bytes = Vec::with_capacity(input.len() / 2 + usize::from(append_line_break));
-        for index in (0..input.len()).step_by(2) {
-            let byte = u8::from_str_radix(&input[index..index + 2], 16).map_err(|_| {
-                DomainError::invalid_argument(
-                    ErrorCode::InvalidHex,
-                    "Hex payload contains invalid characters.",
-                    "Use only valid hexadecimal characters.",
-                )
-            })?;
-            bytes.push(byte);
-        }
+        let mut bytes = hex_to_bytes(input)?;
         if append_line_break {
             bytes.push(b'\n');
         }
@@ -73,10 +54,7 @@ impl PayloadSummary {
         let preview_bytes = bytes.len().min(max_preview_bytes);
         let preview = match encoding {
             PayloadEncoding::Text => String::from_utf8_lossy(&bytes[..preview_bytes]).to_string(),
-            PayloadEncoding::Hex => bytes[..preview_bytes]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>(),
+            PayloadEncoding::Hex => bytes_to_hex(&bytes[..preview_bytes]),
         };
         Self {
             preview,
