@@ -37,6 +37,9 @@ jobs:
       - name: Install cargo-edit
         uses: taiki-e/install-action@cargo-edit
 
+      - name: Install Linux system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+
       - name: Run Rust gates
         run: |
           cargo fmt --check

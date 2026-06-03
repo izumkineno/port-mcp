@@ -24,6 +24,8 @@ cargo test --locked
 
 这些检查默认覆盖无硬件路径。真实串口与 VISA 设备验收仍按 acceptance 文档和本地手工验证执行，不进入 GitHub Actions 强制门禁。
 
+Ubuntu runner 在运行这些 Rust gate 或构建 Linux release artifact 前会安装 `pkg-config` 和 `libudev-dev`。这是 `serialport` 依赖链中的 `libudev-sys` 在 Linux 上定位 `libudev.pc` 所必需的系统依赖。
+
 ## 版本规则
 
 版本源是根目录 `Cargo.toml` 的 `[package].version`。`version.yml` 会逐个读取 latest `vX.Y.Z` tag 之后的提交信息，并按提交 subject 和 breaking footer 选择最高优先级 bump：
