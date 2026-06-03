@@ -3,7 +3,7 @@ name: Version Tag
 on:
   push:
     branches:
-      - main
+      - master
     paths-ignore:
       - 'mcp-server/**'
       - 'docs/**'
@@ -14,7 +14,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: rust-version-main
+  group: rust-version-master
   cancel-in-progress: false
 
 jobs:
@@ -107,5 +107,5 @@ jobs:
           git add Cargo.toml Cargo.lock
           git commit -m "chore(release): ${{ steps.next.outputs.tag }} [skip ci]"
           git tag "${{ steps.next.outputs.tag }}"
-          git push origin HEAD:main
+          git push origin HEAD:master
           git push origin "${{ steps.next.outputs.tag }}"

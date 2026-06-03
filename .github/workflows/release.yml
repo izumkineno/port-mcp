@@ -35,8 +35,9 @@ jobs:
             echo "Invalid release tag: ${GITHUB_REF_NAME}"
             exit 1
           fi
-          git fetch origin main --depth=1
-          git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
+          default_branch="${GITHUB_EVENT_REPOSITORY_DEFAULT_BRANCH:-master}"
+          git fetch origin "${default_branch}" --depth=1
+          git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${default_branch}"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
