@@ -181,6 +181,9 @@ docs/
   - [08-测试与验收计划](docs/08-测试与验收计划.md)
   - [2026-05-26-M8-final-acceptance](docs/acceptance/2026-05-26-M8-final-acceptance.md)
 
+- 想知道 GitHub CI、版本更替和发布自动化：
+  - [28-GitHub-CI版本与发布自动化](docs/28-GitHub-CI版本与发布自动化.md)
+
 - 想知道后续进阶能力怎么落地：
   - [02-进阶实现大纲](docs/02-进阶实现大纲.md)
   - [25-进阶能力施工拆分与验收门槛](docs/25-进阶能力施工拆分与验收门槛.md)

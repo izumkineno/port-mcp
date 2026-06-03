@@ -1,6 +1,8 @@
 /target
 mcp-server
-.github
+.github/*
+!.github/workflows/
+!.github/workflows/*.yml
 .omg
 .omc
 .omx

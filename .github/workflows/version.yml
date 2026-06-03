@@ -1,0 +1,108 @@
+name: Version Tag
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'mcp-server/**'
+      - 'docs/**'
+      - '.omg/**'
+      - '.github/workflows/release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rust-version-main
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Calculate and tag next version
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]' && !contains(github.event.head_commit.message, '[skip ci]') && !startsWith(github.event.head_commit.message, 'chore(release):')
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install cargo-edit
+        uses: taiki-e/install-action@cargo-edit
+
+      - name: Run Rust gates
+        run: |
+          cargo fmt --check
+          cargo check --locked
+          cargo test --locked
+
+      - name: Collect commits since latest release tag
+        id: commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1 || true)"
+          if [ -n "$latest_tag" ]; then
+            range="$latest_tag..HEAD"
+          else
+            range="HEAD"
+          fi
+          git log --format='%n---PORT_MCP_COMMIT---%n%s%n%b' $range > commits.txt
+          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate next version
+        id: next
+        shell: pwsh
+        run: |
+          $manifest = Get-Content Cargo.toml -Raw
+          if ($manifest -notmatch '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"') {
+            throw 'Could not find package version in Cargo.toml'
+          }
+          $commitText = Get-Content commits.txt -Raw
+          $result = ./scripts/next-version.ps1 -CurrentVersion $Matches.version -CommitText $commitText | ConvertFrom-Json
+          "bump=$($result.bump)" >> $env:GITHUB_OUTPUT
+          "next_version=$($result.next_version)" >> $env:GITHUB_OUTPUT
+          "tag=$($result.tag)" >> $env:GITHUB_OUTPUT
+
+      - name: Stop when no release is needed
+        if: steps.next.outputs.bump == 'none'
+        run: echo "No release-worthy Conventional Commits found."
+
+      - name: Ensure tag does not exist
+        if: steps.next.outputs.bump != 'none'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git rev-parse "${{ steps.next.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Tag ${{ steps.next.outputs.tag }} already exists."
+            exit 1
+          fi
+
+      - name: Update Cargo version
+        if: steps.next.outputs.bump != 'none'
+        run: |
+          cargo set-version ${{ steps.next.outputs.next_version }}
+          cargo check
+          cargo check --locked
+          cargo test --locked
+
+      - name: Commit version bump
+        if: steps.next.outputs.bump != 'none'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): ${{ steps.next.outputs.tag }} [skip ci]"
+          git tag "${{ steps.next.outputs.tag }}"
+          git push origin HEAD:main
+          git push origin "${{ steps.next.outputs.tag }}"
