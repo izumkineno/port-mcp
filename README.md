@@ -20,9 +20,11 @@ Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、U
 - 从接收缓冲区拉取数据摘要
 - 清理 `tx`、`rx` 或全部缓冲
 - 订阅实例接收流的最小广播通知
+- 使用 `str_to_hex`、`hex_to_str`、`modbus_helper`、`scpi_helper`、`at_helper`、`slip_helper` 进行轻量编码与协议辅助
+- 通过 `usage_guide` 获取机器可读调用指引，通过 `debug_log_config` 控制原始 I/O 日志预览
 - 通过结构化错误返回、资源锁和状态机约束保证行为可诊断
 
-当前 stdio MCP server 暴露 16 个核心端口调试工具，并额外提供 `usage_guide` 与 `debug_log_config` 辅助工具。详细列表见 [24-MCP工具列表与调用收发详解](docs/24-MCP工具列表与调用收发详解.md)。
+当前 stdio MCP server 暴露 21 个 MCP 工具。当前工具面、实现状态和验证状态见 [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)；1.0.0 历史设计和调用资料见 [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)。
 
 ## 项目定位
 
@@ -39,12 +41,11 @@ Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、U
 当前仓库暂不包含这些进阶能力：
 
 - VISA 之外的专用 USBTMC / GPIB 高级封装
-- Modbus / SCPI / AT / SLIP helper
 - 高级流式订阅触发条件
 - 自动重连、心跳、异常注入
 - 非 loopback 的网络扫描扩展
 
-这些内容已进入进阶规划，见 [02-进阶实现大纲](docs/02-进阶实现大纲.md) 和 [25-进阶能力施工拆分与验收门槛](docs/25-进阶能力施工拆分与验收门槛.md)。
+后续进阶待做项见 [02-进阶实现 TODO](docs/02-进阶实现TODO.md)；1.0.0 设计、进阶规划和施工记录已经归档，见 [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)。
 
 ## 快速开始
 
@@ -81,10 +82,11 @@ cargo test
 - Mock transport
 - TCP/UDP loopback
 - VISA 类型、配置、资源锁与无硬件错误路径
+- 轻量编码与协议 helper
 - 错误模型
 - MCP smoke
 
-M8 验收记录见 [2026-05-26-M8-final-acceptance.md](docs/acceptance/2026-05-26-M8-final-acceptance.md)。
+当前验证摘要见 [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)。历史 M8 验收记录保存在 [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)。
 
 ## MCP 客户端接入
 
@@ -103,16 +105,20 @@ M8 验收记录见 [2026-05-26-M8-final-acceptance.md](docs/acceptance/2026-05-2
 }
 ```
 
-更完整的运行口径、容量限制和日志配置见 [11-配置与运行说明](docs/11-配置与运行说明.md)。
+更完整的运行口径、容量限制和日志配置可从 [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md) 中追溯；当前主要能力摘要见 [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)。
 
 ## 当前工具分组
 
-核心端口调试工具分为 4 组：
+当前 MCP 工具分为 8 组：
 
+- 使用指引：`usage_guide`
 - 实例管理：`instance_create`、`instance_list`、`instance_query`、`instance_use`、`instance_release`
 - 连接配置：`serial_config`、`tcp_udp_config`、`visa_config`
 - 端口行为：`port_scan`、`port_connect`、`port_disconnect`、`port_send`、`port_pull`、`port_clear`
 - 最小流式订阅：`port_subscribe_stream`、`port_unsubscribe_stream`
+- 调试日志：`debug_log_config`
+- 编码辅助：`str_to_hex`、`hex_to_str`
+- 协议辅助：`modbus_helper`、`scpi_helper`、`at_helper`、`slip_helper`
 
 其中 `port_scan` 支持：
 
@@ -122,23 +128,23 @@ M8 验收记录见 [2026-05-26-M8-final-acceptance.md](docs/acceptance/2026-05-2
 
 如果你需要：
 
-- 每个工具的入参和返回外形
-- 示例调用片段
-- 错误边界与日志字段
+- 当前工具分组
+- 当前实现状态
+- 当前验证状态
 
-直接看 [24-MCP工具列表与调用收发详解](docs/24-MCP工具列表与调用收发详解.md)。
+直接看 [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)。历史调用详解保存在 [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)。
 
 ## 验证状态
 
-当前仓库已有初版验收证据：
+当前仓库已有自动化验证证据：
 
 - `cargo fmt --check`
 - `cargo check`
 - `cargo test`
-- Windows 自动化验证
-- Windows 串口手工验收记录
+- TCP/UDP loopback e2e
+- helper 单元测试
 
-对应记录见 [2026-05-26-M8-final-acceptance.md](docs/acceptance/2026-05-26-M8-final-acceptance.md)。
+当前默认 feature 下最近一次 `rtk cargo test` 结果为 98 个 Rust 测试通过。验证摘要见 [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)。
 
 ## 仓库结构
 
@@ -153,48 +159,49 @@ src/
 
 docs/
   00-索引.md
-  01-25 设计 / 施工 / 验收文档
-  acceptance/
+  01-当前工具与实现状态.md
+  02-进阶实现TODO.md
+  1.0.0文档归档/
 ```
 
 如果你想从源码理解项目，建议先读：
 
 1. [00-索引](docs/00-索引.md)
-2. [01-初版工程功能设计大纲](docs/01-初版工程功能设计大纲.md)
-3. [03-初版工具契约](docs/03-初版工具契约.md)
-4. [11-配置与运行说明](docs/11-配置与运行说明.md)
-5. [24-MCP工具列表与调用收发详解](docs/24-MCP工具列表与调用收发详解.md)
+2. [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)
+3. [02-进阶实现 TODO](docs/02-进阶实现TODO.md)
+4. [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)
 
 ## 文档导航
 
 按用途分，推荐这样看：
 
 - 想知道项目做什么：
-  - [01-初版工程功能设计大纲](docs/01-初版工程功能设计大纲.md)
-  - [02-进阶实现大纲](docs/02-进阶实现大纲.md)
+  - [00-索引](docs/00-索引.md)
+  - [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)
 
 - 想知道当前工具怎么调用：
-  - [24-MCP工具列表与调用收发详解](docs/24-MCP工具列表与调用收发详解.md)
+  - [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)
+  - [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)
 
 - 想知道怎么运行和验证：
-  - [11-配置与运行说明](docs/11-配置与运行说明.md)
-  - [08-测试与验收计划](docs/08-测试与验收计划.md)
-  - [2026-05-26-M8-final-acceptance](docs/acceptance/2026-05-26-M8-final-acceptance.md)
+  - [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)
+  - [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)
 
 - 想知道 GitHub CI、版本更替和发布自动化：
-  - [28-GitHub-CI版本与发布自动化](docs/28-GitHub-CI版本与发布自动化.md)
+  - [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)
 
 - 想知道后续进阶能力怎么落地：
-  - [02-进阶实现大纲](docs/02-进阶实现大纲.md)
-  - [25-进阶能力施工拆分与验收门槛](docs/25-进阶能力施工拆分与验收门槛.md)
+  - [02-进阶实现 TODO](docs/02-进阶实现TODO.md)
+  - [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)
 
 ## 开发与贡献
 
 如果你准备继续开发这个仓库，建议先做这几件事：
 
 1. 跑一遍 `cargo check` 和 `cargo test`
-2. 阅读 [13-代码施工大纲](docs/13-代码施工大纲.md)
-3. 阅读 [17-初版施工任务拆分清单](docs/17-初版施工任务拆分清单.md)
-4. 修改实现前，先确认对应设计文档是否已经覆盖该行为
+2. 阅读 [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)
+3. 若要做进阶能力，先阅读 [02-进阶实现 TODO](docs/02-进阶实现TODO.md)
+4. 按需追溯 [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)
+5. 修改实现前，先确认对应设计文档是否已经覆盖该行为
 
 这个仓库的约束比较明确：如果实现与设计冲突，优先回写文档，再改代码。
