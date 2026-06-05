@@ -14,7 +14,7 @@
 | P2 | 链路维持与自动重连 | 待做 | 增加心跳、退避重连、统计和可诊断停止原因。 |
 | P2 | UDP datagram 元数据增强 | 待做 | 保留来源地址、接收时间、长度和多来源统计，同时兼容普通 `port_pull`。 |
 | P3 | VISA 后续增强 | 待做 | 增加可选仪器识别、真实 VISA 环境验收和更清晰的驱动缺失诊断。 |
-| P3 | 协议 helper 后续增强 | 待做 | 扩展 Modbus ASCII/LRC、SCPI/AT 响应摘要和受控探测辅助。 |
+| P3 | 协议 helper 后续增强 | 部分已落地，仍需增强 | `device_probe` 已提供受控 Serial/VISA 探测；仍需扩展 Modbus ASCII/LRC、SCPI/AT 响应摘要和更复杂匹配能力。 |
 | P3 | 异常注入 | 待做 | 模拟断连、延迟、丢包、发送改写和错误校验帧。 |
 
 ## P1 高级流式订阅
@@ -125,8 +125,9 @@
 - [ ] SCPI 响应摘要增强，但不替代仪器手册和厂商专用解析。
 - [ ] AT 响应分类增强，避免硬编码厂商私有扩展为通用契约。
 - [ ] SLIP 与后续组帧能力对齐，明确非法帧、半包和转义错误边界。
-- [ ] 受控 `device_port_probe` 类辅助：只允许有限候选集合、受控并发、总超时和审计记录。
-- [ ] `response_matcher` 最小匹配规则：固定字节、文本片段或 checksum 通过。
+- [x] 受控 `device_probe` 工具：只允许有限候选集合、受控并发和总超时；失败输出可选数量聚合或有限样本；不创建持久 handle，不生成报告文件。
+- [x] `response_matcher` 最小匹配规则：支持文本片段 `contains`、原始字节 `hex_contains`、受限 `regex` 和 `any_response`。
+- [ ] `response_matcher` 后续增强：checksum 通过、协议 helper 联动或其他可证明有界的匹配规则。
 
 验收门槛：
 

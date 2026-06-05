@@ -4,7 +4,7 @@
 ![MCP](https://img.shields.io/badge/MCP-stdio%20server-2F80ED)
 ![Status](https://img.shields.io/badge/status-initial%20scope%20implemented-2D9C5A)
 
-Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、UDP、VISA 仪器调试场景，提供统一的实例管理、连接配置、资源扫描、收发、缓冲区读取和最小流式订阅能力。
+Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、UDP、VISA 仪器调试场景，提供统一的实例管理、连接配置、资源扫描、受控设备探测、收发、缓冲区读取和最小流式订阅能力。
 
 这个仓库的目标不是做一个泛化设备平台，而是让 MCP 客户端能够以稳定、可审计、可验证的方式操作端口连接，并把调试过程沉淀为后续可复用的记录与文档。
 
@@ -15,6 +15,7 @@ Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、U
 - 创建 `Serial`、`TCP`、`UDP`、`Visa` 四类实例
 - 配置串口参数、TCP/UDP 连接参数与 VISA resource address
 - 扫描串口、TCP/UDP loopback 端口与 VISA 资源
+- 使用 `device_probe` 对 Serial/VISA 资源执行受控写入、读取和响应匹配，返回成功配置合集
 - 连接、断开、释放实例
 - 发送 `text` 或 `hex` payload
 - 从接收缓冲区拉取数据摘要
@@ -24,7 +25,7 @@ Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、U
 - 通过 `usage_guide` 获取机器可读调用指引，通过 `debug_log_config` 控制原始 I/O 日志预览
 - 通过结构化错误返回、资源锁和状态机约束保证行为可诊断
 
-当前 stdio MCP server 暴露 21 个 MCP 工具。当前工具面、实现状态和验证状态见 [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)；1.0.0 历史设计和调用资料见 [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)。
+当前 stdio MCP server 暴露 22 个 MCP 工具。当前工具面、实现状态和验证状态见 [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)；1.0.0 历史设计和调用资料见 [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)。
 
 ## 项目定位
 
@@ -33,7 +34,7 @@ Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、U
 当前仓库重点是：
 
 - Rust 原生 MCP server
-- Serial / TCP / UDP / VISA 的统一运行时
+- Serial / TCP / UDP / VISA 的统一运行时与受控 Serial/VISA 探测
 - 明确的状态机、资源生命周期和并发语义
 - 可自动化验证的无硬件路径
 - Windows 串口手工验收兜底
@@ -82,6 +83,7 @@ cargo test
 - Mock transport
 - TCP/UDP loopback
 - VISA 类型、配置、资源锁与无硬件错误路径
+- `device_probe` 参数校验、matcher 与默认 VISA fallback
 - 轻量编码与协议 helper
 - 错误模型
 - MCP smoke
@@ -114,7 +116,7 @@ cargo test
 - 使用指引：`usage_guide`
 - 实例管理：`instance_create`、`instance_list`、`instance_query`、`instance_use`、`instance_release`
 - 连接配置：`serial_config`、`tcp_udp_config`、`visa_config`
-- 端口行为：`port_scan`、`port_connect`、`port_disconnect`、`port_send`、`port_pull`、`port_clear`
+- 端口行为：`port_scan`、`device_probe`、`port_connect`、`port_disconnect`、`port_send`、`port_pull`、`port_clear`
 - 最小流式订阅：`port_subscribe_stream`、`port_unsubscribe_stream`
 - 调试日志：`debug_log_config`
 - 编码辅助：`str_to_hex`、`hex_to_str`
@@ -125,6 +127,13 @@ cargo test
 - `type=Serial`：扫描本机串口
 - `type=Visa`：按 `resource_filter` 和 `max_results` 扫描 VISA 资源，例如 `?*INSTR`
 - `type=TCP` / `type=UDP`：按 loopback host 与端口范围扫描开放端口
+
+其中 `device_probe` 支持：
+
+- `targets=["Serial"]`：扫描或指定串口资源，按候选串口配置发送 payload 并匹配响应
+- `targets=["Visa"]`：扫描或指定 VISA resource，启用 `visa` feature 后执行同样的写读匹配；默认 feature 下返回结构化 unsupported/family error
+- 匹配器支持 `contains`、`hex_contains`、`regex` 和 `any_response`；`regex` 使用 Rust `regex` 引擎，受 pattern 长度和响应字节上限约束，不支持 PCRE lookaround/backreference
+- 失败输出通过 `failure_output` 控制：默认 `counts` 只返回 `summary.failure_status_counts` / `summary.failure_error_counts`，需要明细时可设为 `samples`
 
 如果你需要：
 
@@ -144,7 +153,7 @@ cargo test
 - TCP/UDP loopback e2e
 - helper 单元测试
 
-当前默认 feature 下最近一次 `rtk cargo test` 结果为 98 个 Rust 测试通过。验证摘要见 [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)。
+当前默认 feature 下最近一次 `rtk cargo test` 结果为 104 个 Rust 测试通过。验证摘要见 [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)。
 
 ## 仓库结构
 

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    app::{InstanceService, PortService},
+    app::{DeviceProbeParams, InstanceService, PortService, run_device_probe},
     mcp::response::{self, PortIoDirection, PortIoLog, PortIoLogConfig},
     mcp::session::SessionMode,
     model::{
@@ -169,6 +169,9 @@ impl PortMcpServer {
                     { "tool": "port_send", "arguments": { "handle_id": "<handle_id>", "data": "*IDN?", "encoding": "text", "append_line_break": true } },
                     { "tool": "port_pull", "arguments": { "handle_id": "<handle_id>", "max_bytes": 256 } },
                     { "tool": "port_disconnect", "arguments": { "handle_id": "<handle_id>" } }
+                ],
+                "device_probe": [
+                    { "tool": "device_probe", "arguments": { "targets": ["Serial"], "serial": { "ports": ["COM3"], "baudrates": [9600, 115200] }, "payload": { "data": "*IDN?", "encoding": "text", "append_line_break": true }, "matcher": { "kind": "any_response" }, "failure_output": "counts" } }
                 ]
             },
             "tool_notes": {
@@ -181,6 +184,7 @@ impl PortMcpServer {
                 "tcp_udp_config": "Configure TCP or UDP instances. TCP client uses host/port; TCP listen uses mode=listen plus bind_host/bind_port; UDP uses bind_host/bind_port and optional remote_host/remote_port.",
                 "visa_config": "Configure only Visa instances. Required field: handle_id and resource_address. Optional fields: open_timeout_ms, io_timeout_ms, read_termination, write_termination, encoding. query_idn_on_connect is reserved for later non-blocking identification and is not part of the basic flow.",
                 "port_scan": "Serial scan accepts type=Serial and empty config. Visa scan accepts type=Visa and optional resource_filter/max_results. TCP/UDP scans require loopback host, start_port, and end_port in config.",
+                "device_probe": "Actively probe Serial and/or Visa resources with a caller-provided payload and bounded matcher. It does not create handles or write report files. failure_output defaults to counts; pass samples only when bounded failure details are needed.",
                 "port_connect": "Open the configured Serial, TCP, UDP, or Visa resource. Requires state Configured or Disconnected.",
                 "port_disconnect": "Close a Connected instance while keeping its config for later reconnect.",
                 "port_send": "Send data on a Connected instance. encoding is text or hex; append_line_break defaults to false. For TCP listen, pass peer_id to send to one client; omit peer_id to broadcast to all active clients. Visa instances may append write_termination.",
@@ -793,6 +797,21 @@ impl PortMcpServer {
                 Ok(response)
             }
         }
+    }
+
+    #[tool(
+        description = "Actively probe Serial and/or Visa resources with a caller-provided payload and bounded matcher. Uses resource-level concurrency, does not create persistent handles, and returns successful configuration summaries plus compact counts."
+    )]
+    pub async fn device_probe(
+        &self,
+        Parameters(params): Parameters<DeviceProbeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let response = match run_device_probe(params, RuntimeLimits::default()).await {
+            Ok(result) => self.ok("device_probe", json!(result)),
+            Err(error) => self.err("device_probe", error),
+        };
+        self.result(started_at, response)
     }
 
     async fn port_scan_network(
@@ -3089,6 +3108,98 @@ mod tests {
         .await?;
         assert_eq!(tcp["ok"], true);
         assert!(tcp["data"]["open_ports"].is_array());
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn m10_device_probe_validates_input_and_reports_visa_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let invalid = call_tool_json(
+            &client,
+            "device_probe",
+            object!({
+                "targets": [],
+                "payload": { "data": "ping", "encoding": "text" },
+                "matcher": { "kind": "any_response" }
+            }),
+        )
+        .await?;
+        assert_eq!(invalid["ok"], false);
+        assert_eq!(invalid["error"]["code"], "INVALID_RANGE");
+        assert_eq!(invalid["error"]["details"]["field"], "targets");
+
+        let visa = call_tool_json(
+            &client,
+            "device_probe",
+            object!({
+                "targets": ["Visa"],
+                "visa": {
+                    "resources": ["USB0::0x0000::0x0000::SN::INSTR"],
+                    "open_timeout_ms": 1000,
+                    "io_timeout_ms": 1000
+                },
+                "payload": { "data": "*IDN?", "encoding": "text", "append_line_break": true },
+                "matcher": { "kind": "any_response" },
+                "failure_output": "samples"
+            }),
+        )
+        .await?;
+        assert_eq!(visa["ok"], true);
+        assert_eq!(visa["data"]["summary"]["resources_attempted"], 1);
+        assert_eq!(visa["data"]["summary"]["skipped_count"], 1);
+        assert_eq!(visa["data"]["failure_samples"][0]["status"], "unsupported");
+        assert_eq!(
+            visa["data"]["failure_samples"][0]["error_code"],
+            "FEATURE_NOT_COMPILED"
+        );
+
+        let counts = call_tool_json(
+            &client,
+            "device_probe",
+            object!({
+                "targets": ["Visa"],
+                "visa": {
+                    "resources": ["USB0::0x0000::0x0000::SN::INSTR"],
+                    "open_timeout_ms": 1000,
+                    "io_timeout_ms": 1000
+                },
+                "payload": { "data": "*IDN?", "encoding": "text", "append_line_break": true },
+                "matcher": { "kind": "regex", "value": "(?i).*idn.*|.*" },
+                "failure_output": "counts"
+            }),
+        )
+        .await?;
+        assert_eq!(counts["ok"], true);
+        assert!(counts["data"].get("failure_samples").is_none());
+        assert_eq!(
+            counts["data"]["summary"]["failure_status_counts"]["unsupported"],
+            1
+        );
+        assert_eq!(
+            counts["data"]["summary"]["failure_error_counts"]["FEATURE_NOT_COMPILED"],
+            1
+        );
 
         client.cancel().await?;
         server_handle.await??;
