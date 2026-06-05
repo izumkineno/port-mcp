@@ -17,6 +17,7 @@ Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、U
 - 扫描串口、TCP/UDP loopback 端口与 VISA 资源
 - 使用 `device_probe` 对 Serial/VISA 资源执行受控写入、读取和响应匹配，返回成功配置合集
 - 连接、断开、释放实例
+- 使用 MCP 层 debug profile 和显式 shortcut 工具快速进入调试状态，压缩常见连接、收发和清理迭代
 - 发送 `text` 或 `hex` payload
 - 从接收缓冲区拉取数据摘要
 - 清理 `tx`、`rx` 或全部缓冲
@@ -25,7 +26,7 @@ Rust 原生 `Model Context Protocol` 端口调试服务，面向串口、TCP、U
 - 通过 `usage_guide` 获取机器可读调用指引，通过 `debug_log_config` 控制原始 I/O 日志预览
 - 通过结构化错误返回、资源锁和状态机约束保证行为可诊断
 
-当前 stdio MCP server 暴露 22 个 MCP 工具。当前工具面、实现状态和验证状态见 [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)；1.0.0 历史设计和调用资料见 [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)。
+当前 stdio MCP server 暴露 27 个 MCP 工具。当前工具面、实现状态和验证状态见 [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)；1.0.0 历史设计和调用资料见 [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)。
 
 ## 项目定位
 
@@ -111,13 +112,14 @@ cargo test
 
 ## 当前工具分组
 
-当前 MCP 工具分为 8 组：
+当前 MCP 工具分为 9 组：
 
 - 使用指引：`usage_guide`
 - 实例管理：`instance_create`、`instance_list`、`instance_query`、`instance_use`、`instance_release`
 - 连接配置：`serial_config`、`tcp_udp_config`、`visa_config`
 - 端口行为：`port_scan`、`device_probe`、`port_connect`、`port_disconnect`、`port_send`、`port_pull`、`port_clear`
 - 最小流式订阅：`port_subscribe_stream`、`port_unsubscribe_stream`
+- 快速调试：`debug_profile_set`、`debug_profile_get`、`debug_connect`、`debug_exchange`、`debug_close`
 - 调试日志：`debug_log_config`
 - 编码辅助：`str_to_hex`、`hex_to_str`
 - 协议辅助：`modbus_helper`、`scpi_helper`、`at_helper`、`slip_helper`
@@ -185,21 +187,22 @@ docs/
 按用途分，推荐这样看：
 
 - 想知道项目做什么：
+
   - [00-索引](docs/00-索引.md)
   - [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)
-
 - 想知道当前工具怎么调用：
+
   - [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)
   - [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)
-
 - 想知道怎么运行和验证：
+
   - [01-当前工具与实现状态](docs/01-当前工具与实现状态.md)
   - [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)
-
 - 想知道 GitHub CI、版本更替和发布自动化：
-  - [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)
 
+  - [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)
 - 想知道后续进阶能力怎么落地：
+
   - [02-进阶实现 TODO](docs/02-进阶实现TODO.md)
   - [1.0.0 文档归档](docs/1.0.0文档归档/00-索引.md)
 

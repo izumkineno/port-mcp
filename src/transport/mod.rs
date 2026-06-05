@@ -184,12 +184,19 @@ mod tests {
         let peers = wait_for_tcp_peers(&server, 2);
         assert_eq!(peers.len(), 2);
         assert!(peers[0].peer_id.starts_with("h_tcp_001:peer-"));
-        let peer_a = peers[0].peer_id.clone();
-        let peer_b = peers[1].peer_id.clone();
+        let first_peer = peers[0].peer_id.clone();
+        let second_peer = peers[1].peer_id.clone();
 
-        let targeted = server.write(Some(&peer_a), b"one").unwrap();
-        assert_eq!(targeted.successful_peer_ids, vec![peer_a.clone()]);
-        assert_eq!(client_a.read(8).unwrap(), b"one".to_vec());
+        let targeted = server.write(Some(&first_peer), b"one").unwrap();
+        assert_eq!(targeted.successful_peer_ids, vec![first_peer.clone()]);
+        let (peer_a, peer_b) = match client_a.read(8) {
+            Ok(bytes) if bytes == b"one".to_vec() => (first_peer, second_peer),
+            Ok(bytes) => panic!("unexpected targeted payload: {bytes:?}"),
+            Err(_) => {
+                assert_eq!(client_b.read(8).unwrap(), b"one".to_vec());
+                (second_peer, first_peer)
+            }
+        };
 
         let broadcast = server.write(None, b"all").unwrap();
         assert_eq!(broadcast.successful_peer_ids.len(), 2);

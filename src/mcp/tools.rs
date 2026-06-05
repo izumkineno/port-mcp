@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -7,7 +8,7 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, handler::server::wrapper::Parameters,
     model::CallToolResult, schemars, service::RequestContext, tool, tool_handler, tool_router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
@@ -32,6 +33,7 @@ pub struct PortMcpServer {
     app: Arc<Mutex<InstanceService>>,
     ids: Arc<Mutex<IdGenerator>>,
     port_io_log_config: Arc<Mutex<PortIoLogConfig>>,
+    debug_profiles: Arc<Mutex<HashMap<String, DebugProfile>>>,
 }
 
 impl PortMcpServer {
@@ -50,6 +52,7 @@ impl PortMcpServer {
             ))),
             ids: Arc::new(Mutex::new(IdGenerator::new_for_tests(date))),
             port_io_log_config: Arc::new(Mutex::new(PortIoLogConfig::default())),
+            debug_profiles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -116,6 +119,10 @@ impl PortMcpServer {
         format!("mcp-session-{:#?}", context.id)
     }
 
+    fn debug_profile_key(&self, _context: &RequestContext<RoleServer>) -> String {
+        SessionMode::RequestContextDebug.as_str().to_owned()
+    }
+
     fn usage_guide_data() -> Value {
         json!({
             "purpose": "Help a new MCP agent use port-mcp correctly when only tool metadata is available.",
@@ -123,6 +130,7 @@ impl PortMcpServer {
                 "Always pass handle_id explicitly after instance_create; do not rely on session defaults unless you intentionally called instance_use.",
                 "Normal lifecycle is create -> configure -> connect -> send/pull or subscribe -> disconnect -> release.",
                 "Use port_scan before serial_config or visa_config when the resource name is unknown.",
+                "Use debug_profile_set, debug_connect, debug_exchange, and debug_close for fast interactive debugging; shortcut tools still return explicit handle_id and phase results.",
                 "Use debug_log_config only when troubleshooting raw I/O logs; port_io_log_bytes=0 disables raw I/O logging."
             ],
             "common_sequences": {
@@ -172,6 +180,12 @@ impl PortMcpServer {
                 ],
                 "device_probe": [
                     { "tool": "device_probe", "arguments": { "targets": ["Serial"], "serial": { "ports": ["COM3"], "baudrates": [9600, 115200] }, "payload": { "data": "*IDN?", "encoding": "text", "append_line_break": true }, "matcher": { "kind": "any_response" }, "failure_output": "counts" } }
+                ],
+                "debug_tcp_client": [
+                    { "tool": "debug_profile_set", "arguments": { "transport": "TCP", "tcp": { "mode": "client", "host": "127.0.0.1", "port": 9000, "timeout_ms": 1000 }, "payload": { "encoding": "text", "append_line_break": false }, "pull": { "max_bytes": 64 } } },
+                    { "tool": "debug_connect", "arguments": {} },
+                    { "tool": "debug_exchange", "arguments": { "data": "ping" } },
+                    { "tool": "debug_close", "arguments": { "release": true } }
                 ]
             },
             "tool_notes": {
@@ -184,7 +198,12 @@ impl PortMcpServer {
                 "tcp_udp_config": "Configure TCP or UDP instances. TCP client uses host/port; TCP listen uses mode=listen plus bind_host/bind_port; UDP uses bind_host/bind_port and optional remote_host/remote_port.",
                 "visa_config": "Configure only Visa instances. Required field: handle_id and resource_address. Optional fields: open_timeout_ms, io_timeout_ms, read_termination, write_termination, encoding. query_idn_on_connect is reserved for later non-blocking identification and is not part of the basic flow.",
                 "port_scan": "Serial scan accepts type=Serial and empty config. Visa scan accepts type=Visa and optional resource_filter/max_results. TCP/UDP scans require loopback host, start_port, and end_port in config.",
-                "device_probe": "Actively probe Serial and/or Visa resources with a caller-provided payload and bounded matcher. It does not create handles or write report files. failure_output defaults to counts; pass samples only when bounded failure details are needed.",
+                "device_probe": "Actively probe Serial and/or Visa resources with a caller-provided payload and bounded matcher. It is temporary probing: it does not create handles, bind debug profiles, or write report files. failure_output defaults to counts; pass samples only when bounded failure details are needed.",
+                "debug_profile_set": "Store temporary MCP-layer debug defaults for the current request-context debug session. It does not create, configure, connect, send, pull, clear, disconnect, release, or change debug_log_config.",
+                "debug_profile_get": "Return the current debug profile, scope marker, suggested next tools, and whether any bound handle is still valid.",
+                "debug_connect": "Create/configure/connect through the normal atomic service path using profile defaults plus overrides. Always keep the returned handle_id, phase results, and cleanup hint.",
+                "debug_exchange": "Run optional explicit clear, then send and pull on an already Connected handle. It does not implicitly connect and returns per-phase clear/send/pull results.",
+                "debug_close": "Disconnect a debug handle by default. Pass release=true only when the instance should also be released; releasing a profile-bound handle invalidates that binding.",
                 "port_connect": "Open the configured Serial, TCP, UDP, or Visa resource. Requires state Configured or Disconnected.",
                 "port_disconnect": "Close a Connected instance while keeping its config for later reconnect.",
                 "port_send": "Send data on a Connected instance. encoding is text or hex; append_line_break defaults to false. For TCP listen, pass peer_id to send to one client; omit peer_id to broadcast to all active clients. Visa instances may append write_termination.",
@@ -210,7 +229,7 @@ pub struct InstanceCreateParams {
     instance_type: InstanceTypeParam,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum InstanceTypeParam {
     #[serde(rename = "Serial", alias = "serial", alias = "SERIAL")]
     Serial,
@@ -301,7 +320,7 @@ pub struct VisaConfigParams {
     query_idn_on_connect: bool,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TcpModeParam {
     Client,
@@ -376,6 +395,186 @@ pub struct SubscribeParams {
 pub struct DebugLogConfigParams {
     #[serde(default)]
     port_io_log_bytes: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DebugProfileParams {
+    #[serde(default)]
+    transport: Option<InstanceTypeParam>,
+    #[serde(default)]
+    serial: Option<DebugSerialProfileParams>,
+    #[serde(default)]
+    tcp: Option<DebugTcpProfileParams>,
+    #[serde(default)]
+    udp: Option<DebugUdpProfileParams>,
+    #[serde(default)]
+    visa: Option<DebugVisaProfileParams>,
+    #[serde(default)]
+    payload: Option<DebugPayloadDefaultsParams>,
+    #[serde(default)]
+    pull: Option<DebugPullDefaultsParams>,
+    #[serde(default)]
+    bound_handle_id: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DebugSerialProfileParams {
+    #[serde(default)]
+    port: Option<String>,
+    #[serde(default)]
+    baudrate: Option<u32>,
+    #[serde(default)]
+    data_bits: Option<DataBitsParam>,
+    #[serde(default)]
+    stop_bits: Option<StopBitsParam>,
+    #[serde(default)]
+    parity: Option<ParityParam>,
+    #[serde(default)]
+    flow_control: Option<FlowControlParam>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    encoding: Option<EncodingParam>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DebugTcpProfileParams {
+    #[serde(default)]
+    mode: Option<TcpModeParam>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    bind_host: Option<String>,
+    #[serde(default)]
+    bind_port: Option<u16>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DebugUdpProfileParams {
+    #[serde(default)]
+    bind_host: Option<String>,
+    #[serde(default)]
+    bind_port: Option<u16>,
+    #[serde(default)]
+    remote_host: Option<String>,
+    #[serde(default)]
+    remote_port: Option<u16>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DebugVisaProfileParams {
+    #[serde(default)]
+    resource_address: Option<String>,
+    #[serde(default)]
+    open_timeout_ms: Option<u64>,
+    #[serde(default)]
+    io_timeout_ms: Option<u64>,
+    #[serde(default)]
+    read_termination: Option<String>,
+    #[serde(default)]
+    write_termination: Option<String>,
+    #[serde(default)]
+    encoding: Option<EncodingParam>,
+    #[serde(default)]
+    query_idn_on_connect: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DebugPayloadDefaultsParams {
+    #[serde(default)]
+    encoding: Option<EncodingParam>,
+    #[serde(default)]
+    append_line_break: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DebugPullDefaultsParams {
+    #[serde(default)]
+    max_bytes: Option<usize>,
+    #[serde(default)]
+    peer_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+pub struct DebugConnectParams {
+    #[serde(default)]
+    transport: Option<InstanceTypeParam>,
+    #[serde(default)]
+    serial: Option<DebugSerialProfileParams>,
+    #[serde(default)]
+    tcp: Option<DebugTcpProfileParams>,
+    #[serde(default)]
+    udp: Option<DebugUdpProfileParams>,
+    #[serde(default)]
+    visa: Option<DebugVisaProfileParams>,
+    #[serde(default)]
+    reuse_bound_handle: bool,
+    #[serde(default = "default_true")]
+    bind_profile_handle: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DebugClearTargetParam {
+    Tx,
+    Rx,
+    All,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+pub struct DebugExchangeParams {
+    #[serde(default)]
+    handle_id: Option<String>,
+    #[serde(default)]
+    clear_before: Option<DebugClearTargetParam>,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    encoding: Option<EncodingParam>,
+    #[serde(default)]
+    append_line_break: Option<bool>,
+    #[serde(default = "default_true")]
+    pull_after: bool,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+    #[serde(default)]
+    peer_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+pub struct DebugCloseParams {
+    #[serde(default)]
+    handle_id: Option<String>,
+    #[serde(default)]
+    release: bool,
+    #[serde(default)]
+    force_release: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct DebugProfile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<InstanceTypeParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serial: Option<DebugSerialProfileParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tcp: Option<DebugTcpProfileParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    udp: Option<DebugUdpProfileParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visa: Option<DebugVisaProfileParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<DebugPayloadDefaultsParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pull: Option<DebugPullDefaultsParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bound_handle_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -483,7 +682,11 @@ fn default_crc_check() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ClearTargetParam {
     Tx,
@@ -497,7 +700,7 @@ impl Default for ClearTargetParam {
     }
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum EncodingParam {
     Text,
@@ -510,19 +713,19 @@ impl Default for EncodingParam {
     }
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum DataBitsParam {
     Seven,
     Eight,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum StopBitsParam {
     One,
     Two,
 }
 
-#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum ParityParam {
     #[default]
     None,
@@ -530,7 +733,7 @@ pub enum ParityParam {
     Even,
 }
 
-#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum FlowControlParam {
     #[default]
     None,
@@ -610,7 +813,7 @@ impl PortMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let started_at = Instant::now();
         let handle = params.handle_id.as_deref().map(HandleId::from);
-        let session_id = self.session_id(&context);
+        let session_id = self.debug_profile_key(&context);
         let summary = self.with_app(|app| app.query(handle.as_ref(), Some(&session_id)));
         self.summary_response(started_at, "instance_query", summary)
     }
@@ -625,7 +828,7 @@ impl PortMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let started_at = Instant::now();
         let handle = HandleId::from(params.handle_id.as_str());
-        let session_id = self.session_id(&context);
+        let session_id = self.debug_profile_key(&context);
         let previous = self.with_app(|app| app.use_instance(Some(&session_id), &handle));
         let response = match previous {
             Ok(previous_handle_id) => self
@@ -811,6 +1014,354 @@ impl PortMcpServer {
             Ok(result) => self.ok("device_probe", json!(result)),
             Err(error) => self.err("device_probe", error),
         };
+        self.result(started_at, response)
+    }
+
+    #[tool(
+        description = "Store temporary MCP-layer debug defaults for this request-context debug session. It does not create, configure, connect, send, pull, clear, disconnect, release, or change debug_log_config."
+    )]
+    pub async fn debug_profile_set(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<DebugProfileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let session_id = self.debug_profile_key(&context);
+        let profile = DebugProfile::from_params(params);
+        self.debug_profiles
+            .lock()
+            .expect("debug profiles mutex poisoned")
+            .insert(session_id, profile.clone());
+        let data = self.debug_profile_data(&profile);
+        self.result(started_at, self.ok("debug_profile_set", data))
+    }
+
+    #[tool(
+        description = "Return the temporary MCP-layer debug profile, scope marker, suggested next tools, and whether the bound handle is still valid."
+    )]
+    pub async fn debug_profile_get(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let session_id = self.debug_profile_key(&context);
+        let profile = self
+            .debug_profiles
+            .lock()
+            .expect("debug profiles mutex poisoned")
+            .get(&session_id)
+            .cloned();
+        let data = match profile {
+            Some(profile) => self.debug_profile_data(&profile),
+            None => json!({
+                "scope": self.debug_scope(),
+                "profile": null,
+                "derived_defaults": null,
+                "bound_handle": null,
+                "suggested_next_tools": ["debug_profile_set"]
+            }),
+        };
+        self.result(started_at, self.ok("debug_profile_get", data))
+    }
+
+    #[tool(
+        description = "Create, configure, and connect through the normal atomic service path using debug profile defaults plus overrides. Always returns handle_id, phase results, and cleanup guidance."
+    )]
+    pub async fn debug_connect(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<DebugConnectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let session_id = self.debug_profile_key(&context);
+        let profile = self.debug_profile_for_session(&session_id);
+        let transport = params
+            .transport
+            .or(profile.as_ref().and_then(|profile| profile.transport))
+            .ok_or_else(|| {
+                DomainError::invalid_argument(
+                    ErrorCode::MissingRequiredField,
+                    "debug_connect requires a transport after merging debug profile defaults.",
+                    "Pass transport or call debug_profile_set with a transport.",
+                )
+                .with_detail("field", json!("transport"))
+            });
+        let transport = match transport {
+            Ok(transport) => transport,
+            Err(error) => return self.result(started_at, self.err("debug_connect", error)),
+        };
+        let config = match self.debug_config_for_transport(transport, &profile, &params) {
+            Ok(config) => config,
+            Err(error) => return self.result(started_at, self.err("debug_connect", error)),
+        };
+        let reuse_requested = params.reuse_bound_handle;
+        let bind_profile_handle = params.bind_profile_handle;
+        let response = self.with_app(|app| {
+            let mut phases = Vec::new();
+            let create_summary = match app.create(InstanceType::from(transport)) {
+                Ok(summary) => summary,
+                Err(error) => return self.debug_phase_failure("debug_connect", phases, "create", None, error),
+            };
+            let handle = create_summary.handle_id.clone();
+            phases.push(debug_phase("create", &create_summary, json!({ "reused": false })));
+
+            let configured = match configure_debug_instance(app, &handle, config) {
+                Ok(summary) => summary,
+                Err(error) => return self.debug_phase_failure("debug_connect", phases, "configure", Some(handle), error),
+            };
+            phases.push(debug_phase("configure", &configured, json!({ "summary": configured })));
+
+            let connected = match app.connect(&handle) {
+                Ok(summary) => summary,
+                Err(error) => return self.debug_phase_failure("debug_connect", phases, "connect", Some(handle), error),
+            };
+            phases.push(debug_phase("connect", &connected, json!({ "summary": connected })));
+
+            let mut bound_to_profile = false;
+            if bind_profile_handle {
+                if let Ok(previous_handle_id) = app.use_instance(Some(&session_id), &handle) {
+                    phases.push(json!({
+                        "phase": "profile_bind",
+                        "ok": true,
+                        "handle_id": handle,
+                        "previous_handle_id": previous_handle_id
+                    }));
+                    bound_to_profile = true;
+                }
+            }
+            if bound_to_profile {
+                self.bind_profile_handle(&session_id, &handle);
+            }
+            self.ok(
+                "debug_connect",
+                json!({
+                    "scope": self.debug_scope(),
+                    "handle_id": handle,
+                    "type": connected.instance_type,
+                    "state": connected.state,
+                    "reused": false,
+                    "reuse_requested": reuse_requested,
+                    "bound_to_profile": bound_to_profile,
+                    "summary": connected,
+                    "phases": phases,
+                    "cleanup_hint": "Call debug_close with this handle_id; pass release=true when the instance should be removed."
+                }),
+            )
+            .with_handle(handle)
+            .with_state(InstanceState::Connected)
+        });
+        self.result(started_at, response)
+    }
+
+    #[tool(
+        description = "Run optional explicit clear, then send and pull on an already Connected handle. It does not connect implicitly and returns clear/send/pull phase results."
+    )]
+    pub async fn debug_exchange(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<DebugExchangeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let session_id = self.debug_profile_key(&context);
+        let profile = self.debug_profile_for_session(&session_id);
+        let used_profile_handle = params.handle_id.is_none();
+        let handle = match params.handle_id.clone().or_else(|| {
+            profile
+                .as_ref()
+                .and_then(|profile| profile.bound_handle_id.clone())
+        }) {
+            Some(handle_id) => HandleId::from(handle_id.as_str()),
+            None => {
+                let error = DomainError::invalid_argument(
+                    ErrorCode::MissingRequiredField,
+                    "debug_exchange requires handle_id or a valid profile-bound handle.",
+                    "Pass handle_id, call debug_connect, or bind a handle with debug_profile_set.",
+                )
+                .with_detail("field", json!("handle_id"));
+                return self.result(started_at, self.err("debug_exchange", error));
+            }
+        };
+        let payload_defaults = profile
+            .as_ref()
+            .and_then(|profile| profile.payload.as_ref());
+        let pull_defaults = profile.as_ref().and_then(|profile| profile.pull.as_ref());
+        let encoding = params
+            .encoding
+            .or_else(|| payload_defaults.and_then(|payload| payload.encoding))
+            .unwrap_or_default();
+        let append_line_break = params
+            .append_line_break
+            .or_else(|| payload_defaults.and_then(|payload| payload.append_line_break))
+            .unwrap_or(false);
+        let max_bytes = params
+            .max_bytes
+            .or_else(|| pull_defaults.and_then(|pull| pull.max_bytes));
+        let peer_id = params
+            .peer_id
+            .clone()
+            .or_else(|| pull_defaults.and_then(|pull| pull.peer_id.clone()));
+        let response = self.with_app(|app| {
+            let mut phases = Vec::new();
+            match app.query(Some(&handle), None) {
+                Ok(summary) if summary.state == InstanceState::Connected => {}
+                Ok(summary) => {
+                    let error = DomainError::new(
+                        crate::model::ErrorCategory::InvalidState,
+                        ErrorCode::StateNotAllowed,
+                        "debug_exchange requires a Connected instance.",
+                        "Call port_connect or debug_connect first; debug_exchange never connects implicitly.",
+                        false,
+                    )
+                    .with_detail("current_state", json!(summary.state));
+                    return self.debug_phase_failure("debug_exchange", phases, "preflight", Some(handle), error);
+                }
+                Err(error) => return self.debug_phase_failure("debug_exchange", phases, "preflight", Some(handle), error),
+            }
+            if let Some(target) = params.clear_before {
+                let target = map_debug_clear_target(target);
+                match app.clear(&handle, target) {
+                    Ok(result) => phases.push(json!({
+                        "phase": "clear",
+                        "ok": true,
+                        "target": debug_clear_target_name(target),
+                        "dropped_tx_items": result.dropped_tx_items,
+                        "dropped_tx_bytes": result.dropped_tx_bytes,
+                        "dropped_rx_bytes": result.dropped_rx_bytes
+                    })),
+                    Err(error) => return self.debug_phase_failure("debug_exchange", phases, "clear", Some(handle), error),
+                }
+            }
+            if let Some(data) = params.data {
+                let payload = match encoding {
+                    EncodingParam::Text => Payload::from_text(&data, append_line_break),
+                    EncodingParam::Hex => Payload::from_hex(&data, append_line_break),
+                };
+                let payload = match payload {
+                    Ok(payload) => payload,
+                    Err(error) => return self.debug_phase_failure("debug_exchange", phases, "send", Some(handle), error),
+                };
+                match app.send(&handle, &payload, peer_id.as_deref()) {
+                    Ok(result) => phases.push(json!({
+                        "phase": "send",
+                        "ok": true,
+                        "queued": result.queued,
+                        "sent_bytes": result.sent_bytes,
+                        "target": debug_send_target(result.target)
+                    })),
+                    Err(error) => return self.debug_phase_failure("debug_exchange", phases, "send", Some(handle), error),
+                }
+            }
+            if params.pull_after {
+                match app.pull(&handle, max_bytes, peer_id.as_deref()) {
+                    Ok(result) => phases.push(json!({
+                        "phase": "pull",
+                        "ok": true,
+                        "payload": PortService::summarize_payload(&result.bytes, PayloadEncoding::Text),
+                        "truncated": result.truncated,
+                        "remaining_rx_buffer_bytes": result.remaining_rx_buffer_bytes,
+                        "source": debug_pull_source(result.source)
+                    })),
+                    Err(error) => return self.debug_phase_failure("debug_exchange", phases, "pull", Some(handle), error),
+                }
+            }
+            self.ok(
+                "debug_exchange",
+                json!({
+                    "scope": self.debug_scope(),
+                    "handle_id": handle,
+                    "state": InstanceState::Connected,
+                    "used_profile_handle": used_profile_handle,
+                    "phases": phases,
+                    "cleanup_hint": "Call debug_close with this handle_id when the debug session is done."
+                }),
+            )
+            .with_handle(handle)
+            .with_state(InstanceState::Connected)
+        });
+        self.result(started_at, response)
+    }
+
+    #[tool(
+        description = "Disconnect a debug handle by default and optionally release it with release=true. Releasing a profile-bound handle invalidates that binding."
+    )]
+    pub async fn debug_close(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(params): Parameters<DebugCloseParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let started_at = Instant::now();
+        let session_id = self.debug_profile_key(&context);
+        let profile = self.debug_profile_for_session(&session_id);
+        let handle = match params.handle_id.clone().or_else(|| {
+            profile
+                .as_ref()
+                .and_then(|profile| profile.bound_handle_id.clone())
+        }) {
+            Some(handle_id) => HandleId::from(handle_id.as_str()),
+            None => {
+                let error = DomainError::invalid_argument(
+                    ErrorCode::MissingRequiredField,
+                    "debug_close requires handle_id or a profile-bound handle.",
+                    "Pass handle_id or call debug_profile_get to inspect the current debug profile.",
+                )
+                .with_detail("field", json!("handle_id"));
+                return self.result(started_at, self.err("debug_close", error));
+            }
+        };
+        let response = self.with_app(|app| {
+            let mut phases = Vec::new();
+            let disconnected = match app.disconnect(&handle) {
+                Ok(summary) => summary,
+                Err(error) => {
+                    return self.debug_phase_failure(
+                        "debug_close",
+                        phases,
+                        "disconnect",
+                        Some(handle),
+                        error,
+                    );
+                }
+            };
+            phases.push(debug_phase(
+                "disconnect",
+                &disconnected,
+                json!({ "summary": disconnected }),
+            ));
+            let mut final_summary = disconnected;
+            if params.release {
+                final_summary = match app.release(&handle, params.force_release) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        return self.debug_phase_failure(
+                            "debug_close",
+                            phases,
+                            "release",
+                            Some(handle),
+                            error,
+                        );
+                    }
+                };
+                phases.push(debug_phase(
+                    "release",
+                    &final_summary,
+                    json!({ "summary": final_summary }),
+                ));
+                self.unbind_profile_handle(&session_id, &handle);
+            }
+            self.ok(
+                "debug_close",
+                json!({
+                    "scope": self.debug_scope(),
+                    "handle_id": handle,
+                    "state": final_summary.state,
+                    "released": params.release,
+                    "phases": phases,
+                    "summary": final_summary
+                }),
+            )
+            .with_handle(handle)
+            .with_state(final_summary.state)
+        });
         self.result(started_at, response)
     }
 
@@ -1395,6 +1946,412 @@ fn map_tcp_mode(value: TcpModeParam) -> TcpMode {
     }
 }
 
+fn map_debug_clear_target(value: DebugClearTargetParam) -> ClearTarget {
+    match value {
+        DebugClearTargetParam::Tx => ClearTarget::Tx,
+        DebugClearTargetParam::Rx => ClearTarget::Rx,
+        DebugClearTargetParam::All => ClearTarget::All,
+    }
+}
+
+fn debug_clear_target_name(value: ClearTarget) -> &'static str {
+    match value {
+        ClearTarget::Tx => "tx",
+        ClearTarget::Rx => "rx",
+        ClearTarget::All => "all",
+    }
+}
+
+enum DebugConfig {
+    Serial(SerialConfig),
+    Tcp(TcpConfig),
+    Udp(UdpConfig),
+    Visa(VisaConfig),
+}
+
+fn configure_debug_instance(
+    app: &mut InstanceService,
+    handle: &HandleId,
+    config: DebugConfig,
+) -> Result<InstanceSummary, DomainError> {
+    match config {
+        DebugConfig::Serial(config) => app.configure_serial(handle, config),
+        DebugConfig::Tcp(config) => app.configure_tcp(handle, config),
+        DebugConfig::Udp(config) => app.configure_udp(handle, config),
+        DebugConfig::Visa(config) => app.configure_visa(handle, config),
+    }
+}
+
+fn debug_phase(phase: &str, summary: &InstanceSummary, data: Value) -> Value {
+    json!({
+        "phase": phase,
+        "ok": true,
+        "handle_id": summary.handle_id,
+        "state": summary.state,
+        "data": data
+    })
+}
+
+fn debug_send_target(target: Option<crate::runtime::SendTargetSummary>) -> Value {
+    match target {
+        Some(target) => json!({
+            "mode": match target.mode {
+                crate::runtime::SendTargetMode::Peer => "peer",
+                crate::runtime::SendTargetMode::Broadcast => "broadcast",
+            },
+            "peer_id": target.peer_id,
+            "peer_count": target.peer_count,
+            "successful_peer_ids": target.successful_peer_ids,
+            "failed_peer_count": target.failed_peer_count
+        }),
+        None => Value::Null,
+    }
+}
+
+fn debug_pull_source(source: Option<crate::runtime::PullSource>) -> Value {
+    match source {
+        Some(source) => json!({
+            "transport": source.transport,
+            "peer_id": source.peer_id,
+            "remote_addr": source.remote_addr
+        }),
+        None => Value::Null,
+    }
+}
+
+impl DebugProfile {
+    fn from_params(params: DebugProfileParams) -> Self {
+        Self {
+            transport: params.transport,
+            serial: params.serial,
+            tcp: params.tcp,
+            udp: params.udp,
+            visa: params.visa,
+            payload: params.payload,
+            pull: params.pull,
+            bound_handle_id: params.bound_handle_id.flatten(),
+        }
+    }
+}
+
+impl PortMcpServer {
+    fn debug_scope(&self) -> Value {
+        json!({
+            "scope": SessionMode::RequestContextDebug.as_str(),
+            "stable_session": false,
+            "profile_state": "mcp_server_memory"
+        })
+    }
+
+    fn debug_profile_for_session(&self, session_id: &str) -> Option<DebugProfile> {
+        self.debug_profiles
+            .lock()
+            .expect("debug profiles mutex poisoned")
+            .get(session_id)
+            .cloned()
+    }
+
+    fn bind_profile_handle(&self, session_id: &str, handle: &HandleId) {
+        if let Some(profile) = self
+            .debug_profiles
+            .lock()
+            .expect("debug profiles mutex poisoned")
+            .get_mut(session_id)
+        {
+            profile.bound_handle_id = Some(handle.as_str().to_owned());
+        }
+    }
+
+    fn unbind_profile_handle(&self, session_id: &str, handle: &HandleId) {
+        if let Some(profile) = self
+            .debug_profiles
+            .lock()
+            .expect("debug profiles mutex poisoned")
+            .get_mut(session_id)
+        {
+            if profile.bound_handle_id.as_deref() == Some(handle.as_str()) {
+                profile.bound_handle_id = None;
+            }
+        }
+    }
+
+    fn debug_profile_data(&self, profile: &DebugProfile) -> Value {
+        let bound_handle = profile.bound_handle_id.as_ref().map(|handle_id| {
+            let handle = HandleId::from(handle_id.as_str());
+            match self.with_app(|app| app.query(Some(&handle), None)) {
+                Ok(summary) => json!({
+                    "handle_id": handle,
+                    "valid": true,
+                    "state": summary.state,
+                    "type": summary.instance_type,
+                    "summary": summary,
+                    "reason": "ok"
+                }),
+                Err(error) => json!({
+                    "handle_id": handle,
+                    "valid": false,
+                    "reason": error.code,
+                    "message": error.message
+                }),
+            }
+        });
+        json!({
+            "scope": self.debug_scope(),
+            "profile": profile,
+            "derived_defaults": self.debug_derived_defaults(profile),
+            "bound_handle": bound_handle,
+            "suggested_next_tools": if profile.bound_handle_id.is_some() {
+                json!(["debug_exchange", "debug_close", "debug_connect"])
+            } else {
+                json!(["debug_connect"])
+            }
+        })
+    }
+
+    fn debug_derived_defaults(&self, profile: &DebugProfile) -> Value {
+        json!({
+            "transport": profile.transport,
+            "payload": {
+                "encoding": profile.payload.as_ref().and_then(|payload| payload.encoding).unwrap_or_default(),
+                "append_line_break": profile.payload.as_ref().and_then(|payload| payload.append_line_break).unwrap_or(false)
+            },
+            "pull": {
+                "max_bytes": profile.pull.as_ref().and_then(|pull| pull.max_bytes).unwrap_or(4096),
+                "peer_id": profile.pull.as_ref().and_then(|pull| pull.peer_id.clone())
+            }
+        })
+    }
+
+    fn debug_config_for_transport(
+        &self,
+        transport: InstanceTypeParam,
+        profile: &Option<DebugProfile>,
+        params: &DebugConnectParams,
+    ) -> Result<DebugConfig, DomainError> {
+        match transport {
+            InstanceTypeParam::Serial => {
+                let merged = merge_serial_profile(
+                    profile.as_ref().and_then(|profile| profile.serial.as_ref()),
+                    params.serial.as_ref(),
+                );
+                let port = merged.port.ok_or_else(|| {
+                    DomainError::invalid_argument(
+                        ErrorCode::MissingRequiredField,
+                        "debug_connect Serial requires serial.port after merging debug profile defaults.",
+                        "Pass serial.port or set it with debug_profile_set.",
+                    )
+                    .with_detail("field", json!("serial.port"))
+                })?;
+                Ok(DebugConfig::Serial(SerialConfig {
+                    port,
+                    baudrate: merged.baudrate.unwrap_or_else(default_baudrate),
+                    data_bits: map_data_bits(merged.data_bits.unwrap_or_else(default_data_bits)),
+                    stop_bits: map_stop_bits(merged.stop_bits.unwrap_or_else(default_stop_bits)),
+                    parity: map_parity(merged.parity.unwrap_or_default()),
+                    flow_control: map_flow_control(merged.flow_control.unwrap_or_default()),
+                    timeout_ms: merged.timeout_ms.unwrap_or_else(default_timeout_ms),
+                    encoding: map_encoding(merged.encoding.unwrap_or_default()),
+                }))
+            }
+            InstanceTypeParam::Tcp => {
+                let merged = merge_tcp_profile(
+                    profile.as_ref().and_then(|profile| profile.tcp.as_ref()),
+                    params.tcp.as_ref(),
+                );
+                let mode = merged.mode.unwrap_or_default();
+                let host = merged.host.or(merged.bind_host).unwrap_or_default();
+                let port = merged.port.or(merged.bind_port).unwrap_or_default();
+                Ok(DebugConfig::Tcp(TcpConfig {
+                    mode: map_tcp_mode(mode),
+                    host,
+                    port,
+                    timeout_ms: merged.timeout_ms.unwrap_or_else(default_timeout_ms),
+                }))
+            }
+            InstanceTypeParam::Udp => {
+                let merged = merge_udp_profile(
+                    profile.as_ref().and_then(|profile| profile.udp.as_ref()),
+                    params.udp.as_ref(),
+                );
+                Ok(DebugConfig::Udp(UdpConfig {
+                    bind_host: merged.bind_host.unwrap_or_default(),
+                    bind_port: merged.bind_port.unwrap_or_default(),
+                    remote_host: merged.remote_host,
+                    remote_port: merged.remote_port,
+                    timeout_ms: merged.timeout_ms.unwrap_or_else(default_timeout_ms),
+                }))
+            }
+            InstanceTypeParam::Visa => {
+                let merged = merge_visa_profile(
+                    profile.as_ref().and_then(|profile| profile.visa.as_ref()),
+                    params.visa.as_ref(),
+                );
+                let resource_address = merged.resource_address.ok_or_else(|| {
+                    DomainError::invalid_argument(
+                        ErrorCode::MissingRequiredField,
+                        "debug_connect Visa requires visa.resource_address after merging debug profile defaults.",
+                        "Pass visa.resource_address or set it with debug_profile_set.",
+                    )
+                    .with_detail("field", json!("visa.resource_address"))
+                })?;
+                Ok(DebugConfig::Visa(VisaConfig {
+                    resource_address,
+                    open_timeout_ms: merged.open_timeout_ms.unwrap_or_else(default_timeout_ms),
+                    io_timeout_ms: merged.io_timeout_ms.unwrap_or_else(default_timeout_ms),
+                    read_termination: merged.read_termination,
+                    write_termination: merged.write_termination,
+                    encoding: map_encoding(merged.encoding.unwrap_or_default()),
+                    query_idn_on_connect: merged.query_idn_on_connect.unwrap_or(false),
+                }))
+            }
+        }
+    }
+
+    fn debug_phase_failure(
+        &self,
+        tool: &str,
+        phases: Vec<Value>,
+        failed_phase: &str,
+        handle: Option<HandleId>,
+        error: DomainError,
+    ) -> ToolResponse {
+        let data = json!({
+            "scope": self.debug_scope(),
+            "phases": phases,
+            "failed_phase": failed_phase,
+            "cleanup_hint": handle.as_ref().map(|handle| format!("Inspect or clean up handle {} with instance_query, debug_close, port_disconnect, or instance_release.", handle.as_str()))
+        });
+        let response = self
+            .err(tool, error)
+            .with_warning(crate::model::Warning::new(
+                "DEBUG_PHASE_FAILURE",
+                &data.to_string(),
+            ));
+        match handle {
+            Some(handle) => response.with_handle(handle),
+            None => response,
+        }
+    }
+}
+
+fn merge_serial_profile(
+    base: Option<&DebugSerialProfileParams>,
+    override_value: Option<&DebugSerialProfileParams>,
+) -> DebugSerialProfileParams {
+    let mut merged = base.cloned().unwrap_or_default();
+    if let Some(value) = override_value {
+        if value.port.is_some() {
+            merged.port = value.port.clone();
+        }
+        if value.baudrate.is_some() {
+            merged.baudrate = value.baudrate;
+        }
+        if value.data_bits.is_some() {
+            merged.data_bits = value.data_bits;
+        }
+        if value.stop_bits.is_some() {
+            merged.stop_bits = value.stop_bits;
+        }
+        if value.parity.is_some() {
+            merged.parity = value.parity;
+        }
+        if value.flow_control.is_some() {
+            merged.flow_control = value.flow_control;
+        }
+        if value.timeout_ms.is_some() {
+            merged.timeout_ms = value.timeout_ms;
+        }
+        if value.encoding.is_some() {
+            merged.encoding = value.encoding;
+        }
+    }
+    merged
+}
+
+fn merge_tcp_profile(
+    base: Option<&DebugTcpProfileParams>,
+    override_value: Option<&DebugTcpProfileParams>,
+) -> DebugTcpProfileParams {
+    let mut merged = base.cloned().unwrap_or_default();
+    if let Some(value) = override_value {
+        if value.mode.is_some() {
+            merged.mode = value.mode;
+        }
+        if value.host.is_some() {
+            merged.host = value.host.clone();
+        }
+        if value.port.is_some() {
+            merged.port = value.port;
+        }
+        if value.bind_host.is_some() {
+            merged.bind_host = value.bind_host.clone();
+        }
+        if value.bind_port.is_some() {
+            merged.bind_port = value.bind_port;
+        }
+        if value.timeout_ms.is_some() {
+            merged.timeout_ms = value.timeout_ms;
+        }
+    }
+    merged
+}
+
+fn merge_udp_profile(
+    base: Option<&DebugUdpProfileParams>,
+    override_value: Option<&DebugUdpProfileParams>,
+) -> DebugUdpProfileParams {
+    let mut merged = base.cloned().unwrap_or_default();
+    if let Some(value) = override_value {
+        if value.bind_host.is_some() {
+            merged.bind_host = value.bind_host.clone();
+        }
+        if value.bind_port.is_some() {
+            merged.bind_port = value.bind_port;
+        }
+        if value.remote_host.is_some() {
+            merged.remote_host = value.remote_host.clone();
+        }
+        if value.remote_port.is_some() {
+            merged.remote_port = value.remote_port;
+        }
+        if value.timeout_ms.is_some() {
+            merged.timeout_ms = value.timeout_ms;
+        }
+    }
+    merged
+}
+
+fn merge_visa_profile(
+    base: Option<&DebugVisaProfileParams>,
+    override_value: Option<&DebugVisaProfileParams>,
+) -> DebugVisaProfileParams {
+    let mut merged = base.cloned().unwrap_or_default();
+    if let Some(value) = override_value {
+        if value.resource_address.is_some() {
+            merged.resource_address = value.resource_address.clone();
+        }
+        if value.open_timeout_ms.is_some() {
+            merged.open_timeout_ms = value.open_timeout_ms;
+        }
+        if value.io_timeout_ms.is_some() {
+            merged.io_timeout_ms = value.io_timeout_ms;
+        }
+        if value.read_termination.is_some() {
+            merged.read_termination = value.read_termination.clone();
+        }
+        if value.write_termination.is_some() {
+            merged.write_termination = value.write_termination.clone();
+        }
+        if value.encoding.is_some() {
+            merged.encoding = value.encoding;
+        }
+        if value.query_idn_on_connect.is_some() {
+            merged.query_idn_on_connect = value.query_idn_on_connect;
+        }
+    }
+    merged
+}
+
 fn map_modbus_mode(value: ModbusModeParam) -> ModbusMode {
     match value {
         ModbusModeParam::Rtu => ModbusMode::Rtu,
@@ -1524,6 +2481,11 @@ mod tests {
             "port_clear",
             "port_subscribe_stream",
             "port_unsubscribe_stream",
+            "debug_profile_set",
+            "debug_profile_get",
+            "debug_connect",
+            "debug_exchange",
+            "debug_close",
             "debug_log_config",
         ] {
             assert!(tool_names.contains(expected), "missing tool {expected}");
@@ -1539,6 +2501,31 @@ mod tests {
         assert!(description.contains("pack requires"));
         assert!(description.contains("optional data_or_hex"));
         assert!(description.contains("unpack requires frame_hex"));
+
+        let debug_connect_tool = tools
+            .tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "debug_connect")
+            .expect("debug_connect tool is registered");
+        let description = debug_connect_tool
+            .description
+            .as_deref()
+            .unwrap_or_default();
+        assert!(description.contains("handle_id"));
+        assert!(description.contains("phase"));
+        assert!(description.contains("cleanup"));
+
+        let debug_exchange_tool = tools
+            .tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "debug_exchange")
+            .expect("debug_exchange tool is registered");
+        let description = debug_exchange_tool
+            .description
+            .as_deref()
+            .unwrap_or_default();
+        assert!(description.contains("Connected"));
+        assert!(description.contains("does not connect"));
 
         client.cancel().await?;
         server_handle.await??;
@@ -1590,6 +2577,22 @@ mod tests {
             "str_to_hex"
         );
         assert_eq!(
+            response["data"]["common_sequences"]["debug_tcp_client"][0]["tool"],
+            "debug_profile_set"
+        );
+        assert_eq!(
+            response["data"]["common_sequences"]["debug_tcp_client"][1]["tool"],
+            "debug_connect"
+        );
+        assert_eq!(
+            response["data"]["common_sequences"]["debug_tcp_client"][2]["tool"],
+            "debug_exchange"
+        );
+        assert_eq!(
+            response["data"]["common_sequences"]["debug_tcp_client"][3]["tool"],
+            "debug_close"
+        );
+        assert_eq!(
             response["data"]["common_sequences"]["helpers"][2]["arguments"]["data_or_hex"],
             "0002"
         );
@@ -1603,10 +2606,189 @@ mod tests {
                 .unwrap()
                 .contains("TCP client uses host/port")
         );
+        assert!(
+            response["data"]["tool_notes"]["debug_exchange"]
+                .as_str()
+                .unwrap()
+                .contains("does not implicitly connect")
+        );
+        assert!(
+            response["data"]["tool_notes"]["device_probe"]
+                .as_str()
+                .unwrap()
+                .contains("does not create handles")
+        );
 
         client.cancel().await?;
         server_handle.await??;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phase1_debug_profile_set_get_stores_defaults_without_creating_instances()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let set = call_tool_json(
+            &client,
+            "debug_profile_set",
+            object!({
+                "transport": "TCP",
+                "tcp": { "mode": "client", "host": "127.0.0.1", "port": 9000, "timeout_ms": 1000 },
+                "payload": { "encoding": "text", "append_line_break": true },
+                "pull": { "max_bytes": 32 }
+            }),
+        )
+        .await?;
+        assert_eq!(set["ok"], true);
+        assert_eq!(set["tool"], "debug_profile_set");
+        assert_eq!(set["data"]["scope"]["scope"], "request_context_debug");
+        assert_eq!(set["data"]["profile"]["transport"], "TCP");
+        assert_eq!(set["data"]["derived_defaults"]["pull"]["max_bytes"], 32);
+
+        let list = call_tool_json(&client, "instance_list", object!({})).await?;
+        assert_eq!(list["data"]["instances"].as_array().unwrap().len(), 0);
+
+        let get = call_tool_json(&client, "debug_profile_get", object!({})).await?;
+        assert_eq!(get["ok"], true);
+        assert_eq!(get["data"]["profile"]["transport"], "TCP");
+        assert!(
+            get["data"]["suggested_next_tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool == "debug_connect")
+        );
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phase1_debug_exchange_rejects_non_connected_handle_without_connecting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let created =
+            call_tool_json(&client, "instance_create", object!({ "type": "TCP" })).await?;
+        let handle_id = created["handle_id"].as_str().unwrap();
+        let rejected = call_tool_json(
+            &client,
+            "debug_exchange",
+            object!({ "handle_id": handle_id, "data": "ping", "encoding": "text", "max_bytes": 16 }),
+        )
+        .await?;
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"]["code"], "STATE_NOT_ALLOWED");
+
+        let query = call_tool_json(
+            &client,
+            "instance_query",
+            object!({ "handle_id": handle_id }),
+        )
+        .await?;
+        assert_eq!(query["state"], "Created");
+
+        client.cancel().await?;
+        server_handle.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phase1_debug_shortcuts_use_profile_bound_handle_when_omitted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests("20260526")
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let port_probe = UdpSocket::bind("127.0.0.1:0").await?;
+        let bind_port = port_probe.local_addr()?.port();
+        drop(port_probe);
+
+        let set = call_tool_json(
+            &client,
+            "debug_profile_set",
+            object!({
+                "transport": "UDP",
+                "udp": {
+                    "bind_host": "127.0.0.1",
+                    "bind_port": bind_port,
+                    "remote_host": "127.0.0.1",
+                    "remote_port": bind_port,
+                    "timeout_ms": 1000
+                },
+                "payload": { "encoding": "text", "append_line_break": false },
+                "pull": { "max_bytes": 64 }
+            }),
+        )
+        .await?;
+        assert_eq!(set["ok"], true);
+
+        let connected = call_tool_json(&client, "debug_connect", object!({})).await?;
+        assert_eq!(connected["ok"], true);
+        let handle_id = connected["handle_id"].as_str().unwrap().to_owned();
+        assert_eq!(connected["data"]["bound_to_profile"], true);
+
+        let exchanged = call_tool_json(
+            &client,
+            "debug_exchange",
+            object!({ "data": "ping", "pull_after": true }),
+        )
+        .await?;
+        assert_eq!(exchanged["ok"], true);
+        assert_eq!(exchanged["handle_id"], handle_id);
+        assert_eq!(exchanged["data"]["used_profile_handle"], true);
+        assert_eq!(exchanged["data"]["phases"][1]["payload"]["preview"], "ping");
+
+        let closed = call_tool_json(&client, "debug_close", object!({ "release": true })).await?;
+        assert_eq!(closed["ok"], true);
+        assert_eq!(closed["handle_id"], handle_id);
+        assert_eq!(closed["data"]["released"], true);
+
+        let profile = call_tool_json(&client, "debug_profile_get", object!({})).await?;
+        assert!(profile["data"]["profile"].get("bound_handle_id").is_none());
+
+        client.cancel().await?;
+        server_handle.await??;
         Ok(())
     }
 
