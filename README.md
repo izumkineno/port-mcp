@@ -134,8 +134,9 @@ cargo test
 
 - `targets=["Serial"]`：扫描或指定串口资源，按候选串口配置发送 payload 并匹配响应
 - `targets=["Visa"]`：扫描或指定 VISA resource，启用 `visa` feature 后执行同样的写读匹配；默认 feature 下返回结构化 unsupported/family error
-- 匹配器支持 `contains`、`hex_contains`、`regex` 和 `any_response`；`regex` 使用 Rust `regex` 引擎，受 pattern 长度和响应字节上限约束，不支持 PCRE lookaround/backreference
-- 失败输出通过 `failure_output` 控制：默认 `counts` 只返回 `summary.failure_status_counts` / `summary.failure_error_counts`，需要明细时可设为 `samples`
+- 匹配器支持 `contains`、`hex_contains`、`regex`、`hex_regex` 和 `any_response`；`regex` 匹配文本预览，`hex_regex` 匹配连续大写十六进制响应（例如 `010302...`）；两者使用 Rust `regex` 引擎，受 pattern 长度和响应字节上限约束，不支持 PCRE lookaround/backreference
+- `debug_exchange` 的 Serial `pull_after` 会做一次额外的有界补读并在 pull phase 返回 `pull_attempts` / `completed_after_timeout`，用于减少首字节先到导致的误判；基础 `port_pull` 仍保持单次拉取语义
+- 失败输出通过 `failure_output` 控制：默认 `counts` 只返回 `summary.failure_status_counts` / `summary.failure_error_counts`，需要明细时可设为 `samples`；样本包含 `retryable` / `recovery_hint`，串口并发探测中短暂的 `serial port was not found` 会作为可重试诊断呈现
 
 如果你需要：
 
