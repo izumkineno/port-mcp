@@ -125,8 +125,8 @@
 - [ ] SCPI 响应摘要增强，但不替代仪器手册和厂商专用解析。
 - [ ] AT 响应分类增强，避免硬编码厂商私有扩展为通用契约。
 - [ ] SLIP 与后续组帧能力对齐，明确非法帧、半包和转义错误边界。
-- [x] 受控 `device_probe` 工具：只允许有限候选集合、受控并发和总超时；失败输出可选数量聚合或有限样本；不创建持久 handle，不生成报告文件。
-- [x] `response_matcher` 最小匹配规则：支持文本片段 `contains`、原始字节 `hex_contains`、受限 `regex` 和 `any_response`。
+- [x] 受控 `device_probe` 工具：只允许有限候选集合、受控并发和总超时；失败输出可选数量聚合或有限样本，样本携带可重试提示；不创建持久 handle，不生成报告文件。
+- [x] `response_matcher` 最小匹配规则：支持文本片段 `contains`、原始字节 `hex_contains`、文本 `regex`、连续十六进制 `hex_regex` 和 `any_response`。
 - [ ] `response_matcher` 后续增强：checksum 通过、协议 helper 联动或其他可证明有界的匹配规则。
 
 验收门槛：

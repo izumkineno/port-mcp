@@ -20,7 +20,7 @@ use crate::{
         InstanceSummary, InstanceType, Parity, Payload, PayloadEncoding, RuntimeLimits,
         SerialConfig, StopBits, TcpConfig, TcpMode, Timestamp, ToolResponse, UdpConfig, VisaConfig,
     },
-    runtime::ClearTarget,
+    runtime::{ClearTarget, PullResult},
     util::{
         ModbusMode, ModbusPackRequest, ModbusUnpackRequest, classify_at,
         decode_slip_frame_with_limit, encode_slip_payload_with_limit, hex_to_str_with_limit,
@@ -202,7 +202,7 @@ impl PortMcpServer {
                 "debug_profile_set": "Store temporary MCP-layer debug defaults for the current request-context debug session. It does not create, configure, connect, send, pull, clear, disconnect, release, or change debug_log_config.",
                 "debug_profile_get": "Return the current debug profile, scope marker, suggested next tools, and whether any bound handle is still valid.",
                 "debug_connect": "Create/configure/connect through the normal atomic service path using profile defaults plus overrides. Always keep the returned handle_id, phase results, and cleanup hint.",
-                "debug_exchange": "Run optional explicit clear, then send and pull on an already Connected handle. It does not implicitly connect and returns per-phase clear/send/pull results.",
+                "debug_exchange": "Run optional explicit clear, then send and pull on an already Connected handle. It does not implicitly connect and returns per-phase clear/send/pull results; Serial pull_after performs one extra bounded pull to aggregate split replies.",
                 "debug_close": "Disconnect a debug handle by default. Pass release=true only when the instance should also be released; releasing a profile-bound handle invalidates that binding.",
                 "port_connect": "Open the configured Serial, TCP, UDP, or Visa resource. Requires state Configured or Disconnected.",
                 "port_disconnect": "Close a Connected instance while keeping its config for later reconnect.",
@@ -1154,7 +1154,7 @@ impl PortMcpServer {
     }
 
     #[tool(
-        description = "Run optional explicit clear, then send and pull on an already Connected handle. It does not connect implicitly and returns clear/send/pull phase results."
+        description = "Run optional explicit clear, then send and pull on an already Connected handle. It does not connect implicitly and returns clear/send/pull phase results. For Serial, pull_after performs one extra bounded pull to aggregate split replies."
     )]
     pub async fn debug_exchange(
         &self,
@@ -1202,8 +1202,8 @@ impl PortMcpServer {
             .or_else(|| pull_defaults.and_then(|pull| pull.peer_id.clone()));
         let response = self.with_app(|app| {
             let mut phases = Vec::new();
-            match app.query(Some(&handle), None) {
-                Ok(summary) if summary.state == InstanceState::Connected => {}
+            let instance_type = match app.query(Some(&handle), None) {
+                Ok(summary) if summary.state == InstanceState::Connected => summary.instance_type,
                 Ok(summary) => {
                     let error = DomainError::new(
                         crate::model::ErrorCategory::InvalidState,
@@ -1216,7 +1216,7 @@ impl PortMcpServer {
                     return self.debug_phase_failure("debug_exchange", phases, "preflight", Some(handle), error);
                 }
                 Err(error) => return self.debug_phase_failure("debug_exchange", phases, "preflight", Some(handle), error),
-            }
+            };
             if let Some(target) = params.clear_before {
                 let target = map_debug_clear_target(target);
                 match app.clear(&handle, target) {
@@ -1252,13 +1252,15 @@ impl PortMcpServer {
                 }
             }
             if params.pull_after {
-                match app.pull(&handle, max_bytes, peer_id.as_deref()) {
-                    Ok(result) => phases.push(json!({
+                match debug_exchange_pull(app, &handle, instance_type, max_bytes, peer_id.as_deref()) {
+                    Ok((result, pull_attempts, completed_after_timeout)) => phases.push(json!({
                         "phase": "pull",
                         "ok": true,
                         "payload": PortService::summarize_payload(&result.bytes, PayloadEncoding::Text),
                         "truncated": result.truncated,
                         "remaining_rx_buffer_bytes": result.remaining_rx_buffer_bytes,
+                        "pull_attempts": pull_attempts,
+                        "completed_after_timeout": completed_after_timeout,
                         "source": debug_pull_source(result.source)
                     })),
                     Err(error) => return self.debug_phase_failure("debug_exchange", phases, "pull", Some(handle), error),
@@ -1992,6 +1994,41 @@ fn debug_phase(phase: &str, summary: &InstanceSummary, data: Value) -> Value {
     })
 }
 
+fn debug_exchange_pull(
+    app: &mut InstanceService,
+    handle: &HandleId,
+    instance_type: InstanceType,
+    max_bytes: Option<usize>,
+    peer_id: Option<&str>,
+) -> Result<(PullResult, usize, bool), DomainError> {
+    let mut result = app.pull(handle, max_bytes, peer_id)?;
+    if instance_type != InstanceType::Serial || result.bytes.is_empty() || result.truncated {
+        return Ok((result, 1, false));
+    }
+
+    let remaining_max_bytes = match max_bytes {
+        Some(limit) => {
+            let remaining = limit.saturating_sub(result.bytes.len());
+            if remaining == 0 {
+                return Ok((result, 1, false));
+            }
+            Some(remaining)
+        }
+        None => None,
+    };
+
+    match app.pull(handle, remaining_max_bytes, peer_id) {
+        Ok(next) => {
+            result.bytes.extend_from_slice(&next.bytes);
+            result.truncated = next.truncated;
+            result.remaining_rx_buffer_bytes = next.remaining_rx_buffer_bytes;
+            Ok((result, 2, false))
+        }
+        Err(error) if error.code == ErrorCode::ReadTimeout => Ok((result, 2, true)),
+        Err(error) => Err(error),
+    }
+}
+
 fn debug_send_target(target: Option<crate::runtime::SendTargetSummary>) -> Value {
     match target {
         Some(target) => json!({
@@ -2421,8 +2458,11 @@ mod tests {
         time::{Duration, timeout},
     };
 
-    use super::PortMcpServer;
-    use crate::model::RuntimeLimits;
+    use super::{PortMcpServer, debug_exchange_pull};
+    use crate::{
+        app::InstanceService,
+        model::{InstanceType, RuntimeLimits, SerialConfig},
+    };
 
     #[derive(Clone)]
     struct SmokeClient {
@@ -2720,6 +2760,33 @@ mod tests {
         client.cancel().await?;
         server_handle.await??;
         Ok(())
+    }
+
+    #[test]
+    fn phase1_debug_exchange_pull_aggregates_split_serial_response() {
+        let mut app = InstanceService::new_for_tests("20260526");
+        let created = app.create(InstanceType::Serial).unwrap();
+        let handle = created.handle_id.clone();
+        app.configure_serial(&handle, SerialConfig::new("COM9"))
+            .unwrap();
+        app.registry.connect_mock(&handle).unwrap();
+        app.attach_serial_worker_for_tests(
+            &handle,
+            crate::transport::serial_worker_for_tests(vec![
+                vec![0x01],
+                vec![0x08, 0x00, 0x00, 0x12, 0x34, 0xED, 0x7C],
+            ]),
+        );
+
+        let (result, attempts, completed_after_timeout) =
+            debug_exchange_pull(&mut app, &handle, InstanceType::Serial, Some(16), None).unwrap();
+
+        assert_eq!(attempts, 2);
+        assert!(!completed_after_timeout);
+        assert_eq!(
+            result.bytes,
+            vec![0x01, 0x08, 0x00, 0x00, 0x12, 0x34, 0xED, 0x7C]
+        );
     }
 
     #[tokio::test]

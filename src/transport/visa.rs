@@ -91,7 +91,9 @@ mod compiled {
             if let Some(termination) = &self.config.write_termination {
                 payload.extend_from_slice(termination.as_bytes());
             }
-            std::io::Write::write(&mut &self.instrument, &payload).map_err(map_io_write_error)
+            std::io::Write::write_all(&mut &self.instrument, &payload)
+                .map_err(map_io_write_error)?;
+            Ok(payload.len())
         }
 
         pub fn read(&self, max_bytes: usize) -> std::result::Result<Vec<u8>, DomainError> {
@@ -240,6 +242,25 @@ mod compiled {
     }
 
     fn map_io_read_error(error: std::io::Error) -> DomainError {
+        let raw = error.to_string();
+        let lowered = raw.to_ascii_lowercase();
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) || lowered.contains("timeout")
+            || lowered.contains("timed out")
+            || lowered.contains("tmo")
+        {
+            return DomainError::new(
+                ErrorCategory::ReadTimeout,
+                ErrorCode::ReadTimeout,
+                "No data was available before the VISA read timeout elapsed.",
+                "Retry, increase io_timeout_ms, or check that the device sent data.",
+                true,
+            )
+            .with_detail("backend", serde_json::json!("visa-rs"))
+            .with_detail("raw_error", serde_json::json!(raw));
+        }
         DomainError::new(
             ErrorCategory::WriteFailed,
             ErrorCode::VisaReadFailed,
@@ -248,7 +269,7 @@ mod compiled {
             false,
         )
         .with_detail("backend", serde_json::json!("visa-rs"))
-        .with_detail("raw_error", serde_json::json!(error.to_string()))
+        .with_detail("raw_error", serde_json::json!(raw))
     }
 
     fn map_visa_error(
@@ -297,6 +318,24 @@ mod compiled {
 
     pub fn feature_not_compiled(tool: &str) -> DomainError {
         DomainError::feature_not_compiled("visa", tool)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::map_io_read_error;
+        use crate::model::{ErrorCategory, ErrorCode};
+
+        #[test]
+        fn unit_visa_io_read_timeout_maps_to_read_timeout() {
+            let error = map_io_read_error(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "operation timed out",
+            ));
+
+            assert_eq!(error.category, ErrorCategory::ReadTimeout);
+            assert_eq!(error.code, ErrorCode::ReadTimeout);
+            assert!(error.retryable);
+        }
     }
 }
 

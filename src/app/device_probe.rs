@@ -1,10 +1,9 @@
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, collections::VecDeque, sync::Arc, time::Instant};
 
 use regex::Regex;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
 
 use crate::{
     model::{
@@ -94,6 +93,7 @@ pub enum ProbeMatcherParams {
     Contains { value: String },
     HexContains { value: String },
     Regex { value: String },
+    HexRegex { value: String },
     AnyResponse,
 }
 
@@ -234,9 +234,15 @@ pub struct ProbeFailureSample {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recv_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_hex: Option<String>,
     #[serde(default)]
     pub truncated: bool,
 }
@@ -272,6 +278,7 @@ enum Matcher {
     Contains(String),
     HexContains(Vec<u8>),
     Regex(Regex),
+    HexRegex(Regex),
     AnyResponse,
 }
 impl Matcher {
@@ -280,6 +287,7 @@ impl Matcher {
             Self::Contains(_) => "contains",
             Self::HexContains(_) => "hex_contains",
             Self::Regex(_) => "regex",
+            Self::HexRegex(_) => "hex_regex",
             Self::AnyResponse => "any_response",
         }
     }
@@ -320,7 +328,6 @@ pub async fn run_device_probe(
     params: DeviceProbeParams,
     runtime_limits: RuntimeLimits,
 ) -> Result<DeviceProbeResponse, DomainError> {
-    let started_at = Instant::now();
     let request = validate_request(params, &runtime_limits)?;
     let mut family_errors = serde_json::Map::new();
     let mut resources = Vec::new();
@@ -352,24 +359,26 @@ pub async fn run_device_probe(
         .with_detail("family_errors", json!(family_errors)));
     }
 
-    let resources_discovered = resources.len();
-    let semaphore = Arc::new(Semaphore::new(
-        request.limits.max_concurrency.min(resources.len()),
-    ));
-    let mut handles = Vec::new();
-    for plan in resources {
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore should stay open");
-        let request = request.clone();
-        handles.push(tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            run_resource_plan(plan, &request)
-        }));
-    }
+    run_resource_plans(resources, request, json!(family_errors), |plan, request| {
+        tokio::task::spawn_blocking(move || run_resource_plan(plan, &request))
+    })
+    .await
+}
 
+async fn run_resource_plans(
+    resources: Vec<ResourcePlan>,
+    request: ProbeRequest,
+    family_errors: Value,
+    mut spawn_plan: impl FnMut(
+        ResourcePlan,
+        ProbeRequest,
+    ) -> tokio::task::JoinHandle<ResourceProbeResult>,
+) -> Result<DeviceProbeResponse, DomainError> {
+    let started_at = Instant::now();
+    let resources_discovered = resources.len();
+    let max_concurrency = request.limits.max_concurrency.min(resources.len()).max(1);
+    let mut resources = resources.into_iter();
+    let mut handles = VecDeque::new();
     let mut response = DeviceProbeResponse {
         successes: Vec::new(),
         summary: ProbeSummary {
@@ -382,13 +391,21 @@ pub async fn run_device_probe(
             timed_out_count: 0,
             failure_status_counts: BTreeMap::new(),
             failure_error_counts: BTreeMap::new(),
-            family_errors: json!(family_errors),
+            family_errors,
             duration_ms: 0,
             stopped_after_first_total_success: false,
         },
         failure_samples: Vec::new(),
     };
-    for handle in handles {
+
+    loop {
+        while handles.len() < max_concurrency {
+            let Some(plan) = resources.next() else { break };
+            handles.push_back(spawn_plan(plan, request.clone()));
+        }
+        let Some(handle) = handles.pop_front() else {
+            break;
+        };
         let result = handle.await.map_err(|error| {
             DomainError::new(
                 ErrorCategory::InvalidState,
@@ -420,6 +437,9 @@ pub async fn run_device_probe(
             response.summary.stopped_after_first_total_success = true;
             break;
         }
+    }
+    for handle in handles {
+        let _ = handle.await;
     }
     response.summary.duration_ms = elapsed_ms(started_at);
     Ok(response)
@@ -617,36 +637,45 @@ fn validate_matcher(
             }
         }
         ProbeMatcherParams::Regex { value } => {
-            if value.is_empty() {
-                return Err(invalid_field(
-                    "matcher.value",
-                    "regex matcher value must not be empty.",
-                ));
-            }
-            if value.len() > regex_pattern_max_bytes {
-                return Err(DomainError::invalid_argument(
-                    ErrorCode::InvalidRange,
-                    "regex matcher value exceeds regex_pattern_max_bytes.",
-                    "Shorten the regex pattern or raise regex_pattern_max_bytes within the allowed hard limit.",
-                )
-                .with_detail("field", json!("matcher.value"))
-                .with_detail("limit", json!(regex_pattern_max_bytes))
-                .with_detail("actual", json!(value.len())));
-            }
-            Regex::new(&value)
-                .map(Matcher::Regex)
-                .map_err(|error| {
-                    DomainError::invalid_argument(
-                        ErrorCode::ProtocolFrameInvalid,
-                        "regex matcher value is not a valid Rust regex pattern.",
-                        "Fix the regex pattern and retry. Rust regex does not support look-around or backreferences.",
-                    )
-                    .with_detail("field", json!("matcher.value"))
-                    .with_detail("raw_error", json!(error.to_string()))
-                })
+            compile_probe_regex(value, regex_pattern_max_bytes, "regex").map(Matcher::Regex)
+        }
+        ProbeMatcherParams::HexRegex { value } => {
+            compile_probe_regex(value, regex_pattern_max_bytes, "hex_regex").map(Matcher::HexRegex)
         }
         ProbeMatcherParams::AnyResponse => Ok(Matcher::AnyResponse),
     }
+}
+
+fn compile_probe_regex(
+    value: String,
+    regex_pattern_max_bytes: usize,
+    matcher_name: &str,
+) -> Result<Regex, DomainError> {
+    if value.is_empty() {
+        return Err(invalid_field(
+            "matcher.value",
+            "regex matcher value must not be empty.",
+        ));
+    }
+    if value.len() > regex_pattern_max_bytes {
+        return Err(DomainError::invalid_argument(
+            ErrorCode::InvalidRange,
+            format!("{matcher_name} matcher value exceeds regex_pattern_max_bytes."),
+            "Shorten the regex pattern or raise regex_pattern_max_bytes within the allowed hard limit.",
+        )
+        .with_detail("field", json!("matcher.value"))
+        .with_detail("limit", json!(regex_pattern_max_bytes))
+        .with_detail("actual", json!(value.len())));
+    }
+    Regex::new(&value).map_err(|error| {
+        DomainError::invalid_argument(
+            ErrorCode::ProtocolFrameInvalid,
+            format!("{matcher_name} matcher value is not a valid Rust regex pattern."),
+            "Fix the regex pattern and retry. Rust regex does not support look-around or backreferences.",
+        )
+        .with_detail("field", json!("matcher.value"))
+        .with_detail("raw_error", json!(error.to_string()))
+    })
 }
 
 fn build_serial_plans(
@@ -821,6 +850,8 @@ fn run_serial_resource_with_attempt(
                 ProbeAttemptStatus::MatcherMiss,
                 None,
                 Some("response did not match probe matcher".to_owned()),
+                Some("Use response_hex/response_preview to refine the matcher, or use hex_regex for binary protocols.".to_owned()),
+                Some(false),
                 Some(&response),
                 request.limits.response_max_bytes,
             )),
@@ -990,6 +1021,8 @@ fn run_visa_resource(
                                 ProbeAttemptStatus::MatcherMiss,
                                 None,
                                 Some("response did not match probe matcher".to_owned()),
+                                Some("Use response_hex/response_preview to refine the matcher, or use hex_regex for binary protocols.".to_owned()),
+                                Some(false),
                                 Some(&response),
                                 request.limits.response_max_bytes,
                             ));
@@ -1048,11 +1081,19 @@ fn matches_response(matcher: &Matcher, response: &[u8]) -> bool {
     match matcher {
         Matcher::Contains(value) => String::from_utf8_lossy(response).contains(value),
         Matcher::Regex(regex) => regex.is_match(&String::from_utf8_lossy(response)),
+        Matcher::HexRegex(regex) => {
+            let hex = hex_preview(response, response.len());
+            regex.is_match(&hex) || regex.is_match(&hex.to_ascii_uppercase())
+        }
         Matcher::HexContains(needle) => response
             .windows(needle.len())
             .any(|window| window == needle),
         Matcher::AnyResponse => !response.is_empty(),
     }
+}
+
+fn hex_preview(response: &[u8], max_preview_bytes: usize) -> String {
+    PayloadSummary::from_bytes(response, PayloadEncoding::Hex, max_preview_bytes, false).preview
 }
 
 fn success(
@@ -1089,11 +1130,16 @@ fn failure_sample(
     status: ProbeAttemptStatus,
     error_code: Option<ErrorCode>,
     message: Option<String>,
+    recovery_hint: Option<String>,
+    retryable: Option<bool>,
     response: Option<&[u8]>,
     max_preview_bytes: usize,
 ) -> ProbeFailureSample {
-    let summary = response.map(|bytes| {
+    let text_summary = response.map(|bytes| {
         PayloadSummary::from_bytes(bytes, PayloadEncoding::Text, max_preview_bytes, false)
+    });
+    let hex_summary = response.map(|bytes| {
+        PayloadSummary::from_bytes(bytes, PayloadEncoding::Hex, max_preview_bytes, false)
     });
     ProbeFailureSample {
         target_type,
@@ -1102,9 +1148,13 @@ fn failure_sample(
         status,
         error_code,
         message,
+        recovery_hint,
+        retryable,
         recv_bytes: response.map(<[u8]>::len),
-        response_preview: summary.as_ref().map(|item| item.preview.clone()),
-        truncated: summary.is_some_and(|item| item.truncated),
+        response_preview: text_summary.as_ref().map(|item| item.preview.clone()),
+        response_hex: hex_summary.as_ref().map(|item| item.preview.clone()),
+        truncated: text_summary.is_some_and(|item| item.truncated)
+            || hex_summary.is_some_and(|item| item.truncated),
     }
 }
 
@@ -1122,17 +1172,26 @@ fn error_failure(
         status,
         Some(error.code),
         Some(error.message),
+        Some(error.recovery_hint),
+        Some(error.retryable),
         None,
         0,
     )
 }
 
 fn transport_error_to_domain(error: crate::transport::TransportError) -> DomainError {
+    let recovery_hint = if error.code == ErrorCode::InvalidAddress
+        && error.message.contains("serial port was not found")
+    {
+        "For serial probe this can be a transient open/enumeration result under concurrent probing; rerun port_scan, retry the specific port, or lower max_concurrency."
+    } else {
+        "Check the resource and retry with adjusted probe settings."
+    };
     DomainError::new(
         error.category,
         error.code,
         error.message,
-        "Check the resource and retry with adjusted probe settings.",
+        recovery_hint,
         !error.fatal,
     )
 }
@@ -1254,6 +1313,11 @@ mod tests {
         ));
         let regex = Regex::new(r"RESI(OK|READY)").unwrap();
         assert!(matches_response(&Matcher::Regex(regex), b":RESIOK\n"));
+        let hex_regex = Regex::new(r"^010302[0-9A-F]+$").unwrap();
+        assert!(matches_response(
+            &Matcher::HexRegex(hex_regex),
+            &[0x01, 0x03, 0x02, 0x01, 0x0B, 0xE5, 0xEC]
+        ));
         assert!(matches_response(&Matcher::AnyResponse, b"x"));
         assert!(!matches_response(&Matcher::AnyResponse, b""));
     }
@@ -1269,6 +1333,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(matcher.name(), "regex");
+
+        let matcher = validate_matcher(
+            ProbeMatcherParams::HexRegex {
+                value: r"^010302[0-9A-F]+$".to_owned(),
+            },
+            &RuntimeLimits::default(),
+            default_regex_pattern_max_bytes(),
+        )
+        .unwrap();
+        assert_eq!(matcher.name(), "hex_regex");
 
         let invalid = validate_matcher(
             ProbeMatcherParams::Regex {
@@ -1373,6 +1447,108 @@ mod tests {
         assert_eq!(result.successes[0].resource, "COM9");
         assert_eq!(result.successes[0].matched_by, "contains");
         assert_eq!(result.successes[0].config["baudrate"], 9_600);
+    }
+
+    #[tokio::test]
+    async fn unit_probe_dispatch_stops_scheduling_after_first_total_success() {
+        let request = ProbeRequest {
+            targets: vec![ProbeTarget::Serial],
+            serial: None,
+            visa: None,
+            payload: Arc::new(b"ping".to_vec()),
+            matcher: Arc::new(Matcher::AnyResponse),
+            limits: ProbeLimitsParams {
+                max_concurrency: 1,
+                stop_after_first_success_total: true,
+                ..ProbeLimitsParams::default()
+            },
+            failure_output: FailureOutputParam::Counts,
+        };
+        let plans = vec![
+            ResourcePlan::Serial {
+                resource: "COM1".to_owned(),
+                candidates: Vec::new(),
+            },
+            ResourcePlan::Serial {
+                resource: "COM2".to_owned(),
+                candidates: Vec::new(),
+            },
+        ];
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let response = run_resource_plans(plans, request, json!({}), |plan, _request| {
+            let dispatched = Arc::clone(&dispatched);
+            let resource = match plan {
+                ResourcePlan::Serial { resource, .. } => resource,
+                ResourcePlan::Visa { resource, .. } => resource,
+            };
+            tokio::spawn(async move {
+                dispatched.lock().unwrap().push(resource.clone());
+                ResourceProbeResult {
+                    successes: vec![success(
+                        ProbeTarget::Serial,
+                        &resource,
+                        json!({}),
+                        "any_response",
+                        4,
+                        b"pong",
+                        16,
+                        0,
+                    )],
+                    ..ResourceProbeResult::default()
+                }
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(*dispatched.lock().unwrap(), vec!["COM1"]);
+        assert_eq!(response.summary.resources_attempted, 1);
+        assert!(response.summary.stopped_after_first_total_success);
+    }
+
+    #[test]
+    fn unit_probe_failure_sample_includes_hex_response_preview() {
+        let sample = failure_sample(
+            ProbeTarget::Serial,
+            "COM9",
+            json!({ "baudrate": 9600 }),
+            ProbeAttemptStatus::MatcherMiss,
+            None,
+            Some("response did not match probe matcher".to_owned()),
+            Some("Use response_hex/response_preview to refine the matcher, or use hex_regex for binary protocols.".to_owned()),
+            Some(false),
+            Some(&[0x01, 0x03, 0x02, 0x01, 0x0B, 0xE5, 0xEC]),
+            32,
+        );
+
+        assert_eq!(sample.recv_bytes, Some(7));
+        assert_eq!(sample.response_hex.as_deref(), Some("010302010be5ec"));
+        assert_eq!(sample.retryable, Some(false));
+    }
+
+    #[test]
+    fn unit_probe_serial_not_found_open_error_is_reported_as_retryable() {
+        let error = transport_error_to_domain(crate::transport::TransportError::invalid_address(
+            "serial port was not found",
+        ));
+        let sample = error_failure(
+            ProbeTarget::Serial,
+            "COM9",
+            json!({ "baudrate": 9600 }),
+            ProbeAttemptStatus::OpenError,
+            error,
+        );
+
+        assert_eq!(sample.error_code, Some(ErrorCode::InvalidAddress));
+        assert_eq!(sample.retryable, Some(true));
+        assert!(
+            sample
+                .recovery_hint
+                .as_deref()
+                .unwrap()
+                .contains("transient open/enumeration")
+        );
     }
 
     #[test]
