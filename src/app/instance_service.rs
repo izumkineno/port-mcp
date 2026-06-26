@@ -205,6 +205,15 @@ impl InstanceService {
         }
     }
 
+    pub fn new() -> Self {
+        Self {
+            registry: RuntimeRegistry::new(),
+            serial_workers: HashMap::new(),
+            network_workers: HashMap::new(),
+            visa_workers: HashMap::new(),
+        }
+    }
+
     pub fn create(&mut self, instance_type: InstanceType) -> Result<InstanceSummary, DomainError> {
         self.registry.create_instance(instance_type)
     }

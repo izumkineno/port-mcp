@@ -1,6 +1,6 @@
 use std::{io, thread, time::Duration};
 
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{net::TcpStream, runtime::Builder, time::timeout};
 
 use crate::model::{DomainError, ErrorCategory, ErrorCode};
 
@@ -201,4 +201,11 @@ pub(crate) fn map_write_error(error: io::Error) -> TransportError {
     } else {
         TransportError::write_failed(ErrorCode::WriteIoFailed, "transport write failed")
     }
+}
+
+pub(crate) fn transport_runtime() -> tokio::runtime::Runtime {
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("transport runtime should be constructible")
 }

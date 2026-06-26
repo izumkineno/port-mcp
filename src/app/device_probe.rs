@@ -456,12 +456,13 @@ fn validate_request(
         ));
     }
     validate_limits(&params.limits, runtime_limits)?;
+    let payload_max = params.limits.payload_max_bytes;
     let payload = match params.payload.encoding {
         ProbeEncoding::Text => {
-            Payload::from_text(&params.payload.data, params.payload.append_line_break)?
+            Payload::from_text_with_limit(&params.payload.data, params.payload.append_line_break, payload_max)?
         }
         ProbeEncoding::Hex => {
-            Payload::from_hex(&params.payload.data, params.payload.append_line_break)?
+            Payload::from_hex_with_limit(&params.payload.data, params.payload.append_line_break, payload_max)?
         }
     };
     if payload.bytes.is_empty() {

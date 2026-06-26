@@ -75,7 +75,22 @@ impl SerialPortSettings {
 
 pub struct SerialWorker {
     commands: mpsc::Sender<SerialCommand>,
-    _thread: JoinHandle<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for SerialWorker {
+    fn drop(&mut self) {
+        if let Some(handle) = self.thread.take() {
+            if let Err(panic) = handle.join() {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_owned());
+                tracing::error!(%msg, "serial worker thread panicked");
+            }
+        }
+    }
 }
 
 impl SerialWorker {
@@ -97,7 +112,7 @@ impl SerialWorker {
         let worker_thread = thread::spawn(move || run_serial_worker(device, receiver));
         Self {
             commands,
-            _thread: worker_thread,
+            thread: Some(worker_thread),
         }
     }
 
@@ -251,7 +266,14 @@ fn receive_worker_reply<T>(
 ) -> Result<T, TransportError> {
     receiver
         .recv_timeout(Duration::from_millis(timeout_ms))
-        .map_err(|_| TransportError::read_timeout("serial worker response timed out"))?
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => {
+                TransportError::read_timeout("serial worker response timed out")
+            }
+            mpsc::RecvTimeoutError::Disconnected => {
+                TransportError::transport_closed("serial worker thread exited unexpectedly")
+            }
+        })?
 }
 
 fn map_serial_data_bits(data_bits: DataBits) -> serialport::DataBits {

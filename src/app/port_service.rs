@@ -394,6 +394,10 @@ fn transport_error_to_domain(error: TransportError) -> DomainError {
 pub struct PortService;
 
 impl PortService {
+    pub fn new() -> Self {
+        Self
+    }
+
     pub fn new_for_tests(_date: &str) -> Self {
         Self
     }

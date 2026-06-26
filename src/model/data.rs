@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::{DomainError, PayloadEncoding};
-use crate::util::encoding::{bytes_to_hex, hex_to_bytes, text_to_bytes};
+use crate::util::encoding::{
+    bytes_to_hex, hex_to_bytes, hex_to_bytes_with_limit, text_to_bytes, text_to_bytes_with_limit,
+};
 
 #[derive(Debug)]
 pub struct Payload {
@@ -27,6 +29,36 @@ impl Payload {
             bytes.push(b'\n');
         }
 
+        Ok(Self {
+            bytes,
+            encoding: PayloadEncoding::Hex,
+        })
+    }
+
+    pub fn from_text_with_limit(
+        input: &str,
+        append_line_break: bool,
+        max_bytes: usize,
+    ) -> Result<Self, DomainError> {
+        let mut bytes = text_to_bytes_with_limit(input, "input_string", max_bytes)?;
+        if append_line_break {
+            bytes.push(b'\n');
+        }
+        Ok(Self {
+            bytes,
+            encoding: PayloadEncoding::Text,
+        })
+    }
+
+    pub fn from_hex_with_limit(
+        input: &str,
+        append_line_break: bool,
+        max_bytes: usize,
+    ) -> Result<Self, DomainError> {
+        let mut bytes = hex_to_bytes_with_limit(input, "hex", max_bytes)?;
+        if append_line_break {
+            bytes.push(b'\n');
+        }
         Ok(Self {
             bytes,
             encoding: PayloadEncoding::Hex,

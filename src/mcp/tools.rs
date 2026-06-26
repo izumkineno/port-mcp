@@ -38,13 +38,20 @@ pub struct PortMcpServer {
 
 impl PortMcpServer {
     pub fn new() -> Self {
-        Self::new_for_tests("20260526")
+        Self {
+            app: Arc::new(Mutex::new(InstanceService::new())),
+            ids: Arc::new(Mutex::new(IdGenerator::new())),
+            port_io_log_config: Arc::new(Mutex::new(PortIoLogConfig::default())),
+            debug_profiles: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
+    #[allow(dead_code)]
     pub fn new_for_tests(date: &str) -> Self {
         Self::new_for_tests_with_limits(date, RuntimeLimits::default())
     }
 
+    #[allow(dead_code)]
     pub fn new_for_tests_with_limits(date: &str, limits: RuntimeLimits) -> Self {
         Self {
             app: Arc::new(Mutex::new(InstanceService::new_for_tests_with_limits(
@@ -119,8 +126,8 @@ impl PortMcpServer {
         format!("mcp-session-{:#?}", context.id)
     }
 
-    fn debug_profile_key(&self, _context: &RequestContext<RoleServer>) -> String {
-        SessionMode::RequestContextDebug.as_str().to_owned()
+    fn debug_profile_key(&self, context: &RequestContext<RoleServer>) -> String {
+        self.session_id(context)
     }
 
     fn usage_guide_data() -> Value {
@@ -971,7 +978,7 @@ impl PortMcpServer {
         let started_at = Instant::now();
         match params.scan_type {
             InstanceTypeParam::Serial => {
-                let service = PortService::new_for_tests("20260526");
+                let service = PortService::new();
                 let response = match service.scan_serial() {
                     Ok(resources) => self.ok("port_scan", json!({ "resources": resources })),
                     Err(error) => self.err("port_scan", error),
@@ -979,7 +986,7 @@ impl PortMcpServer {
                 self.result(started_at, response)
             }
             InstanceTypeParam::Visa => {
-                let service = PortService::new_for_tests("20260526");
+                let service = PortService::new();
                 let response = match service.scan_visa(
                     params
                         .config
@@ -1232,9 +1239,10 @@ impl PortMcpServer {
                 }
             }
             if let Some(data) = params.data {
+                let tx_limit = RuntimeLimits::default().tx_frame_max_bytes;
                 let payload = match encoding {
-                    EncodingParam::Text => Payload::from_text(&data, append_line_break),
-                    EncodingParam::Hex => Payload::from_hex(&data, append_line_break),
+                    EncodingParam::Text => Payload::from_text_with_limit(&data, append_line_break, tx_limit),
+                    EncodingParam::Hex => Payload::from_hex_with_limit(&data, append_line_break, tx_limit),
                 };
                 let payload = match payload {
                     Ok(payload) => payload,
@@ -1399,7 +1407,7 @@ impl PortMcpServer {
         let Some(end_port) = config.end_port else {
             return self.result(started_at, self.missing_scan_config_field("end_port"));
         };
-        let service = PortService::new_for_tests("20260526");
+        let service = PortService::new();
         let response = match service
             .scan_loopback(
                 &host,
@@ -1469,9 +1477,10 @@ impl PortMcpServer {
         let handle = HandleId::from(params.handle_id.as_str());
         let handle_for_app = handle.clone();
         let peer_id = params.peer_id.clone();
+        let tx_limit = RuntimeLimits::default().tx_frame_max_bytes;
         let payload = match params.encoding {
-            EncodingParam::Text => Payload::from_text(&params.data, params.append_line_break),
-            EncodingParam::Hex => Payload::from_hex(&params.data, params.append_line_break),
+            EncodingParam::Text => Payload::from_text_with_limit(&params.data, params.append_line_break, tx_limit),
+            EncodingParam::Hex => Payload::from_hex_with_limit(&params.data, params.append_line_break, tx_limit),
         };
         let response = match payload {
             Ok(payload) => {

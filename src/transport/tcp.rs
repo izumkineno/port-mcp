@@ -9,13 +9,13 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    runtime::Builder,
     sync::mpsc as tokio_mpsc,
     time::timeout,
 };
 
 use super::{
     TransportError, map_read_error, map_tcp_bind_error, map_tcp_connect_error, map_write_error,
+    transport_runtime,
 };
 
 const TCP_LISTEN_INBOUND_MAX_FRAMES: usize = 1024;
@@ -70,8 +70,23 @@ impl TcpClientTransport {
 #[derive(Debug)]
 pub struct TcpClientWorker {
     commands: mpsc::Sender<TcpClientCommand>,
-    _thread: JoinHandle<()>,
+    thread: Option<JoinHandle<()>>,
     timeout_ms: u64,
+}
+
+impl Drop for TcpClientWorker {
+    fn drop(&mut self) {
+        if let Some(handle) = self.thread.take() {
+            if let Err(panic) = handle.join() {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_owned());
+                tracing::error!(%msg, "tcp client worker thread panicked");
+            }
+        }
+    }
 }
 
 impl TcpClientWorker {
@@ -95,7 +110,7 @@ impl TcpClientWorker {
         match ready_rx.recv_timeout(Duration::from_millis(timeout_ms.saturating_add(1_000))) {
             Ok(Ok(())) => Ok(Self {
                 commands,
-                _thread: thread,
+                thread: Some(thread),
                 timeout_ms,
             }),
             Ok(Err(error)) => Err(error),
@@ -132,8 +147,23 @@ impl TcpClientWorker {
 #[derive(Debug)]
 pub struct TcpListenWorker {
     commands: mpsc::Sender<TcpListenCommand>,
-    _thread: JoinHandle<()>,
+    thread: Option<JoinHandle<()>>,
     timeout_ms: u64,
+}
+
+impl Drop for TcpListenWorker {
+    fn drop(&mut self) {
+        if let Some(handle) = self.thread.take() {
+            if let Err(panic) = handle.join() {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_owned());
+                tracing::error!(%msg, "tcp listen worker thread panicked");
+            }
+        }
+    }
 }
 
 impl TcpListenWorker {
@@ -169,7 +199,7 @@ impl TcpListenWorker {
         match ready_rx.recv_timeout(Duration::from_millis(timeout_ms.saturating_add(1_000))) {
             Ok(Ok(())) => Ok(Self {
                 commands,
-                _thread: thread,
+                thread: Some(thread),
                 timeout_ms,
             }),
             Ok(Err(error)) => Err(error),
@@ -292,13 +322,6 @@ enum TcpListenEvent {
     },
     Inbound(TcpInboundFrame),
     Disconnected(String),
-}
-
-fn transport_runtime() -> tokio::runtime::Runtime {
-    Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("transport runtime should be constructible")
 }
 
 fn run_tcp_client_worker(
@@ -649,7 +672,14 @@ fn receive_worker_reply<T>(
 ) -> Result<T, TransportError> {
     receiver
         .recv_timeout(Duration::from_millis(timeout_ms))
-        .map_err(|_| TransportError::read_timeout("tcp worker response timed out"))?
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => {
+                TransportError::read_timeout("tcp worker response timed out")
+            }
+            mpsc::RecvTimeoutError::Disconnected => {
+                TransportError::transport_closed("tcp worker thread exited unexpectedly")
+            }
+        })?
 }
 
 #[derive(Debug)]

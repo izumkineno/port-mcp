@@ -64,6 +64,21 @@ impl RuntimeRegistry {
         }
     }
 
+    pub fn new() -> Self {
+        Self {
+            instances: HashMap::new(),
+            released_handles: HashSet::new(),
+            session_bindings: HashMap::new(),
+            resource_locks: HashMap::new(),
+            ids: IdGenerator::new(),
+            limits: RuntimeLimits::default(),
+            buffer_bytes_budget: 0,
+            queued_bytes_budget: 0,
+            global_notification_tick: None,
+            global_notifications_this_tick: 0,
+        }
+    }
+
     pub fn create_instance(
         &mut self,
         instance_type: InstanceType,

@@ -114,6 +114,23 @@ impl IdGenerator {
         }
     }
 
+    pub fn new() -> Self {
+        let fmt = time::format_description::parse("[year][month][day]")
+            .expect("date format description valid");
+        let today = time::OffsetDateTime::now_utc()
+            .format(&fmt)
+            .expect("UTC date should format");
+        Self {
+            date: today,
+            request_counter: Cell::new(0),
+            error_counter: Cell::new(0),
+            serial_counter: Cell::new(0),
+            tcp_counter: Cell::new(0),
+            udp_counter: Cell::new(0),
+            visa_counter: Cell::new(0),
+        }
+    }
+
     pub fn next_request_id(&self) -> RequestId {
         let sequence = self.next(&self.request_counter);
         RequestId::from_parts(&self.date, sequence)

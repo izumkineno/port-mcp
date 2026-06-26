@@ -6,9 +6,9 @@ use std::{
     time::Duration,
 };
 
-use tokio::{net::UdpSocket, runtime::Builder, time::timeout};
+use tokio::{net::UdpSocket, time::timeout};
 
-use super::{TransportError, map_read_error, map_udp_bind_error, map_write_error};
+use super::{TransportError, map_read_error, map_udp_bind_error, map_write_error, transport_runtime};
 
 #[derive(Debug)]
 pub struct UdpTransport {
@@ -67,9 +67,24 @@ impl UdpTransport {
 #[derive(Debug)]
 pub struct UdpWorker {
     commands: mpsc::Sender<UdpCommand>,
-    _thread: JoinHandle<()>,
+    thread: Option<JoinHandle<()>>,
     timeout_ms: u64,
     local_addr: SocketAddr,
+}
+
+impl Drop for UdpWorker {
+    fn drop(&mut self) {
+        if let Some(handle) = self.thread.take() {
+            if let Err(panic) = handle.join() {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_owned());
+                tracing::error!(%msg, "udp worker thread panicked");
+            }
+        }
+    }
 }
 
 impl UdpWorker {
@@ -94,7 +109,7 @@ impl UdpWorker {
         match ready_rx.recv_timeout(Duration::from_millis(timeout_ms.saturating_add(1_000))) {
             Ok(Ok(local_addr)) => Ok(Self {
                 commands,
-                _thread: thread,
+                thread: Some(thread),
                 timeout_ms,
                 local_addr,
             }),
@@ -141,13 +156,6 @@ enum UdpCommand {
     ),
     Recv(usize, mpsc::Sender<Result<Vec<u8>, TransportError>>),
     Close(mpsc::Sender<Result<(), TransportError>>),
-}
-
-fn transport_runtime() -> tokio::runtime::Runtime {
-    Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("transport runtime should be constructible")
 }
 
 fn run_udp_worker(
@@ -200,7 +208,14 @@ fn receive_worker_reply<T>(
 ) -> Result<T, TransportError> {
     receiver
         .recv_timeout(Duration::from_millis(timeout_ms))
-        .map_err(|_| TransportError::read_timeout("udp worker response timed out"))?
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => {
+                TransportError::read_timeout("udp worker response timed out")
+            }
+            mpsc::RecvTimeoutError::Disconnected => {
+                TransportError::transport_closed("udp worker thread exited unexpectedly")
+            }
+        })?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
