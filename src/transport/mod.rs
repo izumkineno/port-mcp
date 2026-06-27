@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 mod common;
-mod mock;
 mod serial;
 mod tcp;
 mod udp;
@@ -10,8 +9,6 @@ mod visa;
 pub(crate) use common::transport_runtime;
 #[allow(unused_imports)]
 pub use common::{ScanResult, TransportError, port_scan_loopback};
-#[allow(unused_imports)]
-pub use mock::MockTransport;
 #[allow(unused_imports)]
 pub use serial::{SerialPortSettings, SerialPortSummary, SerialWorker, scan_serial_ports};
 #[allow(unused_imports)]
@@ -51,27 +48,6 @@ mod tests {
         let closed = TransportError::transport_closed("mock closed");
         assert_eq!(closed.code, ErrorCode::TransportClosed);
         assert!(closed.fatal);
-    }
-
-    #[test]
-    fn integration_mock_transport_injects_reads_observes_writes_and_failures() {
-        let mut transport = MockTransport::new();
-        transport.inject_read(b"pong");
-
-        let read = transport.read_chunk(8).unwrap();
-        assert_eq!(read, b"pong".to_vec());
-
-        let written = transport.write_all(b"ping").unwrap();
-        assert_eq!(written, 4);
-        assert_eq!(transport.writes(), &[b"ping".to_vec()]);
-
-        transport.fail_next_write(ErrorCode::WriteIoFailed);
-        let failed = transport.write_all(b"boom").unwrap_err();
-        assert_eq!(failed.code, ErrorCode::WriteIoFailed);
-
-        transport.close().unwrap();
-        let closed = transport.read_chunk(1).unwrap_err();
-        assert_eq!(closed.code, ErrorCode::TransportClosed);
     }
 
     #[tokio::test]

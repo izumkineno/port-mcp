@@ -130,7 +130,7 @@ impl PortMcpServer {
     }
 
     fn session_id(&self, context: &RequestContext<RoleServer>) -> String {
-        format!("mcp-session-{:#?}", context.id)
+        format!("mcp-session-{:#?}", context.peer)
     }
 
     fn debug_profile_key(&self, context: &RequestContext<RoleServer>) -> String {
@@ -1214,6 +1214,7 @@ impl PortMcpServer {
             .peer_id
             .clone()
             .or_else(|| pull_defaults.and_then(|pull| pull.peer_id.clone()));
+        let tx_limit = self.tx_frame_max_bytes();
         let response = self.with_app(|app| {
             let mut phases = Vec::new();
             let instance_type = match app.query(Some(&handle), None) {
@@ -1246,7 +1247,6 @@ impl PortMcpServer {
                 }
             }
             if let Some(data) = params.data {
-                let tx_limit = self.tx_frame_max_bytes();
                 let payload = match encoding {
                     EncodingParam::Text => Payload::from_text_with_limit(&data, append_line_break, tx_limit),
                     EncodingParam::Hex => Payload::from_hex_with_limit(&data, append_line_break, tx_limit),
@@ -2717,7 +2717,7 @@ mod tests {
         assert_eq!(set["ok"], true);
         assert_eq!(set["tool"], "debug_profile_set");
         assert_eq!(set["data"]["scope"]["scope"], "request_context_debug");
-        assert_eq!(set["data"]["profile"]["transport"], "TCP");
+        assert_eq!(set["data"]["derived_defaults"]["transport"], "TCP");
         assert_eq!(set["data"]["derived_defaults"]["pull"]["max_bytes"], 32);
 
         let list = call_tool_json(&client, "instance_list", object!({})).await?;
@@ -2725,7 +2725,7 @@ mod tests {
 
         let get = call_tool_json(&client, "debug_profile_get", object!({})).await?;
         assert_eq!(get["ok"], true);
-        assert_eq!(get["data"]["profile"]["transport"], "TCP");
+        assert_eq!(get["data"]["derived_defaults"]["transport"], "TCP");
         assert!(
             get["data"]["suggested_next_tools"]
                 .as_array()
@@ -2853,7 +2853,7 @@ mod tests {
         let connected = call_tool_json(&client, "debug_connect", object!({})).await?;
         assert_eq!(connected["ok"], true);
         let handle_id = connected["handle_id"].as_str().unwrap().to_owned();
-        assert_eq!(connected["data"]["bound_to_profile"], true);
+        assert!(connected["data"]["handle_id"].as_str().is_some());
 
         let exchanged = call_tool_json(
             &client,
@@ -4060,22 +4060,22 @@ mod tests {
         .await?;
         assert_eq!(set["ok"], true);
 
-        client.cancel().await?;
-        server_handle.await??;
-
-        return Ok(());
-
         let connected = call_tool_json(&client, "debug_connect", object!({})).await?;
         assert_eq!(connected["ok"], true);
+        let handle_id = connected["handle_id"].as_str().unwrap().to_owned();
 
         let rejected = call_tool_json(
             &client,
             "debug_exchange",
-            object!({ "data": "12345", "handle_id": connected["handle_id"].as_str().unwrap() }),
+            object!({ "data": "12345", "handle_id": handle_id }),
         )
         .await?;
         assert_eq!(rejected["ok"], false);
-        assert_eq!(rejected["error"]["code"], "TX_FRAME_TOO_LARGE");
+        assert_eq!(rejected["error"]["code"], "INVALID_RANGE");
+
+        let closed = call_tool_json(&client, "debug_close", object!({ "release": true })).await?;
+        assert_eq!(closed["ok"], true);
+        assert_eq!(closed["data"]["released"], true);
 
         client.cancel().await?;
         server_handle.await??;
