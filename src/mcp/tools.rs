@@ -1486,8 +1486,12 @@ impl PortMcpServer {
         let peer_id = params.peer_id.clone();
         let tx_limit = self.tx_frame_max_bytes();
         let payload = match params.encoding {
-            EncodingParam::Text => Payload::from_text_with_limit(&params.data, params.append_line_break, tx_limit),
-            EncodingParam::Hex => Payload::from_hex_with_limit(&params.data, params.append_line_break, tx_limit),
+            EncodingParam::Text => {
+                Payload::from_text_with_limit(&params.data, params.append_line_break, tx_limit)
+            }
+            EncodingParam::Hex => {
+                Payload::from_hex_with_limit(&params.data, params.append_line_break, tx_limit)
+            }
         };
         let response = match payload {
             Ok(payload) => {

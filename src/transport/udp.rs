@@ -8,7 +8,9 @@ use std::{
 
 use tokio::{net::UdpSocket, time::timeout};
 
-use super::{TransportError, map_read_error, map_udp_bind_error, map_write_error, transport_runtime};
+use super::{
+    TransportError, map_read_error, map_udp_bind_error, map_write_error, transport_runtime,
+};
 
 #[derive(Debug)]
 pub struct UdpTransport {

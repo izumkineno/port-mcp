@@ -7,9 +7,9 @@ mod tcp;
 mod udp;
 mod visa;
 
+pub(crate) use common::transport_runtime;
 #[allow(unused_imports)]
 pub use common::{ScanResult, TransportError, port_scan_loopback};
-pub(crate) use common::transport_runtime;
 #[allow(unused_imports)]
 pub use mock::MockTransport;
 #[allow(unused_imports)]
