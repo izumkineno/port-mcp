@@ -214,6 +214,10 @@ impl InstanceService {
         }
     }
 
+    pub fn tx_frame_max_bytes(&self) -> usize {
+        self.registry.tx_frame_max_bytes()
+    }
+
     pub fn create(&mut self, instance_type: InstanceType) -> Result<InstanceSummary, DomainError> {
         self.registry.create_instance(instance_type)
     }

@@ -74,12 +74,13 @@ impl SerialPortSettings {
 }
 
 pub struct SerialWorker {
-    commands: mpsc::Sender<SerialCommand>,
+    commands: Option<mpsc::Sender<SerialCommand>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Drop for SerialWorker {
     fn drop(&mut self) {
+        let _ = self.commands.take();
         if let Some(handle) = self.thread.take() {
             if let Err(panic) = handle.join() {
                 let msg = panic
@@ -111,7 +112,7 @@ impl SerialWorker {
         let (commands, receiver) = mpsc::channel();
         let worker_thread = thread::spawn(move || run_serial_worker(device, receiver));
         Self {
-            commands,
+            commands: Some(commands),
             thread: Some(worker_thread),
         }
     }
@@ -119,6 +120,8 @@ impl SerialWorker {
     pub fn write(&self, bytes: &[u8], timeout_ms: u64) -> Result<usize, TransportError> {
         let (reply, receiver) = mpsc::channel();
         self.commands
+            .as_ref()
+            .expect("serial worker command sender should exist")
             .send(SerialCommand::Write(bytes.to_vec(), reply))
             .map_err(|_| TransportError::transport_closed("serial worker is closed"))?;
         receive_worker_reply(receiver, timeout_ms)
@@ -127,6 +130,8 @@ impl SerialWorker {
     pub fn read(&self, max_bytes: usize, timeout_ms: u64) -> Result<Vec<u8>, TransportError> {
         let (reply, receiver) = mpsc::channel();
         self.commands
+            .as_ref()
+            .expect("serial worker command sender should exist")
             .send(SerialCommand::Read(max_bytes, reply))
             .map_err(|_| TransportError::transport_closed("serial worker is closed"))?;
         receive_worker_reply(receiver, timeout_ms)
@@ -135,6 +140,8 @@ impl SerialWorker {
     pub fn close(&self, timeout_ms: u64) -> Result<(), TransportError> {
         let (reply, receiver) = mpsc::channel();
         self.commands
+            .as_ref()
+            .expect("serial worker command sender should exist")
             .send(SerialCommand::Close(reply))
             .map_err(|_| TransportError::transport_closed("serial worker is closed"))?;
         receive_worker_reply(receiver, timeout_ms)

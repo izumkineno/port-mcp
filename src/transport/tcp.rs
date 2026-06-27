@@ -69,13 +69,14 @@ impl TcpClientTransport {
 
 #[derive(Debug)]
 pub struct TcpClientWorker {
-    commands: mpsc::Sender<TcpClientCommand>,
+    commands: Option<mpsc::Sender<TcpClientCommand>>,
     thread: Option<JoinHandle<()>>,
     timeout_ms: u64,
 }
 
 impl Drop for TcpClientWorker {
     fn drop(&mut self) {
+        let _ = self.commands.take();
         if let Some(handle) = self.thread.take() {
             if let Err(panic) = handle.join() {
                 let msg = panic
@@ -109,7 +110,7 @@ impl TcpClientWorker {
         });
         match ready_rx.recv_timeout(Duration::from_millis(timeout_ms.saturating_add(1_000))) {
             Ok(Ok(())) => Ok(Self {
-                commands,
+                commands: Some(commands),
                 thread: Some(thread),
                 timeout_ms,
             }),
@@ -138,6 +139,8 @@ impl TcpClientWorker {
     ) -> Result<T, TransportError> {
         let (reply, receiver) = mpsc::channel();
         self.commands
+            .as_ref()
+            .expect("tcp client worker command sender should exist")
             .send(build(reply))
             .map_err(|_| TransportError::transport_closed("tcp client worker is closed"))?;
         receive_worker_reply(receiver, self.timeout_ms)
@@ -146,13 +149,14 @@ impl TcpClientWorker {
 
 #[derive(Debug)]
 pub struct TcpListenWorker {
-    commands: mpsc::Sender<TcpListenCommand>,
+    commands: Option<mpsc::Sender<TcpListenCommand>>,
     thread: Option<JoinHandle<()>>,
     timeout_ms: u64,
 }
 
 impl Drop for TcpListenWorker {
     fn drop(&mut self) {
+        let _ = self.commands.take();
         if let Some(handle) = self.thread.take() {
             if let Err(panic) = handle.join() {
                 let msg = panic
@@ -198,7 +202,7 @@ impl TcpListenWorker {
         });
         match ready_rx.recv_timeout(Duration::from_millis(timeout_ms.saturating_add(1_000))) {
             Ok(Ok(())) => Ok(Self {
-                commands,
+                commands: Some(commands),
                 thread: Some(thread),
                 timeout_ms,
             }),
@@ -247,6 +251,8 @@ impl TcpListenWorker {
     ) -> Result<T, TransportError> {
         let (reply, receiver) = mpsc::channel();
         self.commands
+            .as_ref()
+            .expect("tcp listen worker command sender should exist")
             .send(build(reply))
             .map_err(|_| TransportError::transport_closed("tcp listen worker is closed"))?;
         receive_worker_reply(receiver, self.timeout_ms)

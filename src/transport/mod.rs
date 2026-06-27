@@ -323,6 +323,15 @@ mod tests {
     }
 
     #[test]
+    fn unit_serial_worker_drop_after_close_completes() {
+        let device = serial::ScriptedSerialDevice::new(vec![]);
+        let worker = SerialWorker::start_for_tests(device);
+
+        worker.close(100).unwrap();
+        drop(worker);
+    }
+
+    #[test]
     fn unit_serial_errors_map_without_raw_os_text() {
         let busy = serial::map_serial_error_for_tests(
             serialport::ErrorKind::Io(io::ErrorKind::PermissionDenied),

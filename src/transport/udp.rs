@@ -66,7 +66,7 @@ impl UdpTransport {
 
 #[derive(Debug)]
 pub struct UdpWorker {
-    commands: mpsc::Sender<UdpCommand>,
+    commands: Option<mpsc::Sender<UdpCommand>>,
     thread: Option<JoinHandle<()>>,
     timeout_ms: u64,
     local_addr: SocketAddr,
@@ -74,6 +74,7 @@ pub struct UdpWorker {
 
 impl Drop for UdpWorker {
     fn drop(&mut self) {
+        let _ = self.commands.take();
         if let Some(handle) = self.thread.take() {
             if let Err(panic) = handle.join() {
                 let msg = panic
@@ -108,7 +109,7 @@ impl UdpWorker {
         });
         match ready_rx.recv_timeout(Duration::from_millis(timeout_ms.saturating_add(1_000))) {
             Ok(Ok(local_addr)) => Ok(Self {
-                commands,
+                commands: Some(commands),
                 thread: Some(thread),
                 timeout_ms,
                 local_addr,
@@ -142,6 +143,8 @@ impl UdpWorker {
     ) -> Result<T, TransportError> {
         let (reply, receiver) = mpsc::channel();
         self.commands
+            .as_ref()
+            .expect("udp worker command sender should exist")
             .send(build(reply))
             .map_err(|_| TransportError::transport_closed("udp worker is closed"))?;
         receive_worker_reply(receiver, self.timeout_ms)

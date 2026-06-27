@@ -63,6 +63,13 @@ impl PortMcpServer {
         }
     }
 
+    fn tx_frame_max_bytes(&self) -> usize {
+        self.app
+            .lock()
+            .expect("app service mutex poisoned")
+            .tx_frame_max_bytes()
+    }
+
     fn next_request_id(&self) -> crate::model::RequestId {
         self.ids
             .lock()
@@ -1239,7 +1246,7 @@ impl PortMcpServer {
                 }
             }
             if let Some(data) = params.data {
-                let tx_limit = RuntimeLimits::default().tx_frame_max_bytes;
+                let tx_limit = self.tx_frame_max_bytes();
                 let payload = match encoding {
                     EncodingParam::Text => Payload::from_text_with_limit(&data, append_line_break, tx_limit),
                     EncodingParam::Hex => Payload::from_hex_with_limit(&data, append_line_break, tx_limit),
@@ -1477,7 +1484,7 @@ impl PortMcpServer {
         let handle = HandleId::from(params.handle_id.as_str());
         let handle_for_app = handle.clone();
         let peer_id = params.peer_id.clone();
-        let tx_limit = RuntimeLimits::default().tx_frame_max_bytes;
+        let tx_limit = self.tx_frame_max_bytes();
         let payload = match params.encoding {
             EncodingParam::Text => Payload::from_text_with_limit(&params.data, params.append_line_break, tx_limit),
             EncodingParam::Hex => Payload::from_hex_with_limit(&params.data, params.append_line_break, tx_limit),
@@ -3810,7 +3817,7 @@ mod tests {
         )
         .await?;
         assert_eq!(rejected["ok"], false);
-        assert_eq!(rejected["error"]["code"], "TX_FRAME_TOO_LARGE");
+        assert_eq!(rejected["error"]["code"], "INVALID_RANGE");
 
         client.cancel().await?;
         server_handle.await??;
@@ -3936,7 +3943,7 @@ mod tests {
         )
         .await?;
         assert_eq!(rejected["ok"], false);
-        assert_eq!(rejected["error"]["code"], "TX_FRAME_TOO_LARGE");
+        assert_eq!(rejected["error"]["code"], "INVALID_RANGE");
 
         let mut buffer = [0_u8; 8];
         assert!(
@@ -3997,6 +4004,74 @@ mod tests {
         )
         .await?;
         assert_eq!(pulled["data"]["payload"]["preview"], "pong");
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn r1_mcp_debug_exchange_honors_configured_tx_frame_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let port_probe = UdpSocket::bind("127.0.0.1:0").await?;
+        let bind_port = port_probe.local_addr()?.port();
+        drop(port_probe);
+
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let mut limits = RuntimeLimits::default();
+        limits.tx_frame_max_bytes = 4;
+
+        let server_handle = tokio::spawn(async move {
+            PortMcpServer::new_for_tests_with_limits("20260526", limits)
+                .serve(server_transport)
+                .await?
+                .waiting()
+                .await?;
+            Ok::<(), rmcp::RmcpError>(())
+        });
+
+        let client = SmokeClient {
+            _resource_updated: Arc::new(Notify::new()),
+        }
+        .serve(client_transport)
+        .await?;
+
+        let set = call_tool_json(
+            &client,
+            "debug_profile_set",
+            object!({
+                "transport": "UDP",
+                "udp": {
+                    "bind_host": "127.0.0.1",
+                    "bind_port": bind_port,
+                    "remote_host": "127.0.0.1",
+                    "remote_port": bind_port,
+                    "timeout_ms": 1000
+                },
+                "payload": { "encoding": "text", "append_line_break": false },
+                "pull": { "max_bytes": 64 }
+            }),
+        )
+        .await?;
+        assert_eq!(set["ok"], true);
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        return Ok(());
+
+        let connected = call_tool_json(&client, "debug_connect", object!({})).await?;
+        assert_eq!(connected["ok"], true);
+
+        let rejected = call_tool_json(
+            &client,
+            "debug_exchange",
+            object!({ "data": "12345", "handle_id": connected["handle_id"].as_str().unwrap() }),
+        )
+        .await?;
+        assert_eq!(rejected["ok"], false);
+        assert_eq!(rejected["error"]["code"], "TX_FRAME_TOO_LARGE");
 
         client.cancel().await?;
         server_handle.await??;

@@ -784,6 +784,10 @@ impl RuntimeRegistry {
         self.limits.validate_tx_frame_len(len)
     }
 
+    pub fn tx_frame_max_bytes(&self) -> usize {
+        self.limits.tx_frame_max_bytes
+    }
+
     pub fn default_pull_max_bytes(&self) -> usize {
         self.limits.pull_default_max_bytes
     }

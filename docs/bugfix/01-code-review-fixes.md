@@ -91,3 +91,35 @@ fn receive_worker_reply<T>(...) -> Result<T, TransportError> {
 4. **#4**（小改动，提升可观测性） → 快速收益
 5. **#3**（新增构造器，保持测试兼容） → 需仔细处理
 6. **#5**（Drop 语义，需测试） → 复杂度最高，最后修
+
+---
+
+## 本次复查补充修复
+
+> 更新日期: 2026-06-27
+
+### 已修复
+
+1. worker 析构时先断开命令通道，再等待线程退出，避免自然 `Drop` 路径上卡住。
+2. `port_send` 和 `debug_exchange` 改为读取当前实例的 `tx_frame_max_bytes`，不再依赖 `RuntimeLimits::default()` 的静态默认值。
+
+### 变更文件
+
+- `src/transport/serial.rs`
+- `src/transport/tcp.rs`
+- `src/transport/udp.rs`
+- `src/transport/mod.rs`
+- `src/runtime/mod.rs`
+- `src/app/instance_service.rs`
+- `src/mcp/tools.rs`
+
+### 验证结果
+
+- `rtk cargo check`
+- `rtk cargo test unit_serial_worker_drop_after_close_completes -- --test-threads=1 --nocapture`
+- `rtk cargo test r1_mcp_tcp_real_loopback_rejects_oversized_send_before_write -- --test-threads=1 --nocapture`
+- `rtk cargo test r1_mcp_udp_real_loopback_rejects_oversized_send_before_datagram -- --test-threads=1 --nocapture`
+
+### 备注
+
+- `debug_exchange` 的回归场景当前未保留为稳定行为测试；代码修复已落在限制来源修正上。
